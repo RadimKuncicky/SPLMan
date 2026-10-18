@@ -1,0 +1,11 @@
+.build/
+.swiftpm/
+dist/
+.DS_Store
+
+# Local AI assistant and agent configuration
+**/.codex/
+**/.agents/
+**/AGENTS.md
+**/.claude/
+**/CLAUDE.md
