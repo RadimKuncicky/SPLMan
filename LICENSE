@@ -1,0 +1,44 @@
+SPL Man Free Use License
+
+Copyright (c) 2026 Radim Kuncicky. All rights reserved.
+
+Permission is granted, free of charge, to any person or organization to:
+
+1. download the Software and make copies reasonably necessary for their own
+   use;
+2. compile the unmodified source code; and
+3. install and run the unmodified Software for personal or commercial use.
+
+This permission is subject to the following restrictions:
+
+1. The Software and its source code may not be modified, adapted, translated,
+   or used to create derivative works.
+2. The Software, its source code, compiled versions, or copies may not be
+   redistributed, published, sublicensed, sold, rented, transferred, or made
+   available to third parties.
+3. This copyright notice and license must be retained in every permitted copy
+   of the source code.
+
+Changing runtime settings, performing calibration, entering session metadata,
+or creating, recording, and exporting measurements or CSV files through normal
+operation of the Software does not constitute modification of the Software.
+
+All ownership and intellectual property rights in the Software remain with the
+copyright holder. No rights are granted except those expressly stated in this
+license.
+
+Any use outside these terms requires prior written permission from the
+copyright holder. The permission granted by this license terminates
+automatically upon breach of its terms.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. TO THE MAXIMUM EXTENT
+PERMITTED BY LAW, THE COPYRIGHT HOLDER SHALL NOT BE LIABLE FOR ANY CLAIM,
+DAMAGES, OR OTHER LIABILITY ARISING FROM, OUT OF, OR IN CONNECTION WITH THE
+SOFTWARE OR ITS USE.
+
+These terms apply only to original additions and versions first distributed
+with this license, and do not replace rights previously granted for earlier
+code or versions. Earlier versions remain subject to the license under which
+they were distributed.

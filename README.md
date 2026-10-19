@@ -75,3 +75,15 @@ limit.
 Single-point calibration and software tests do not replace type or periodic
 verification of the complete measurement system under IEC 61672. The concert
 alarm is not a declaration of compliance with DIN 15905-5.
+
+## License
+
+SPL Man is source-available under the [SPL Man Free Use License](LICENSE). It
+may be downloaded, compiled without changes, installed, and used free of charge
+for personal or commercial purposes. Modification, derivative works,
+redistribution, sublicensing, and sale are not permitted without prior written
+permission. Normal use includes changing settings, calibrating the application,
+entering session details, and creating or exporting measurements and CSV files.
+
+This is not an open-source license. The official repository and releases are
+maintained by Radim Kuncicky.
