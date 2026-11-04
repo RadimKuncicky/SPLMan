@@ -21,7 +21,8 @@ open dist/SPLMan.app
 
 On first launch, grant microphone access. In Settings, select a specific device
 and channel, attach a 1 kHz calibrator, and select **Calibrate at 94 dB**. The
-app verifies both signal stability and concentration around 1 kHz. After
+app lets the Slow integrator settle for 6 seconds and then verifies both signal
+stability and concentration around 1 kHz, so calibration takes at least 9 seconds. After
 calibration, remove the calibrator and select **Start Input** so the time windows
 begin without the calibration tone. The app never switches to another device
 automatically. If the saved input is unavailable, measurement remains stopped.
@@ -50,7 +51,8 @@ you can enter an event name, location, note, and microphone identification.
 Recent sessions and their status are available in the history. For each session,
 you can view the latest 100 stored events, gaps, and errors.
 
-The CSV uses UTC timestamps and contains the session identifier and status,
+The CSV uses UTC timestamps taken from the system clock for each audio buffer, so
+sound-card clock drift does not accumulate over long sessions. It contains the session identifier and status,
 processed frame and second counts, one-second and long-term metrics, and input,
 channel, and calibration identification. In addition to samples, it records
 status events, alarms, gaps, and errors. An invalid or missing interval is not

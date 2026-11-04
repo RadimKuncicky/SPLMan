@@ -294,18 +294,21 @@ struct PersistedSettings: Codable, Equatable {
 
     init() {}
 
+    /// Each field decodes independently, so an unreadable value (for example
+    /// an enum case written by a newer version) resets only that field and
+    /// never discards the stored calibrations.
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        input = try container.decodeIfPresent(InputSelection.self, forKey: .input)
-        displayedMetrics = try container.decodeIfPresent([Metric].self, forKey: .displayedMetrics)
+        input = (try? container.decodeIfPresent(InputSelection.self, forKey: .input))
+        displayedMetrics = (try? container.decodeIfPresent([Metric].self, forKey: .displayedMetrics))
             ?? [.laeq1, .aSlow, .laeq10]
-        calibrations = try container.decodeIfPresent(
+        calibrations = (try? container.decodeIfPresent(
             [CalibrationKey: CalibrationRecord].self,
             forKey: .calibrations
-        ) ?? [:]
-        thresholds = try container.decodeIfPresent(VisualThresholds.self, forKey: .thresholds)
+        )) ?? [:]
+        thresholds = (try? container.decodeIfPresent(VisualThresholds.self, forKey: .thresholds))
             ?? VisualThresholds()
-        spectrogram = try container.decodeIfPresent(SpectrogramSettings.self, forKey: .spectrogram)
+        spectrogram = (try? container.decodeIfPresent(SpectrogramSettings.self, forKey: .spectrogram))
             ?? SpectrogramSettings()
     }
 }
@@ -321,12 +324,17 @@ final class SettingsStore {
     }
 
     func load() -> PersistedSettings {
-        guard let data = defaults.data(forKey: key),
-              let settings = try? decoder.decode(PersistedSettings.self, from: data) else {
+        guard let data = defaults.data(forKey: key) else { return PersistedSettings() }
+        guard let settings = try? decoder.decode(PersistedSettings.self, from: data) else {
+            // Keep the unreadable blob so the next save cannot destroy the
+            // only copy of the user's calibrations.
+            defaults.set(data, forKey: Self.unreadableBackupKey)
             return PersistedSettings()
         }
         return settings
     }
+
+    static let unreadableBackupKey = "SPLMan.settings.v1.unreadable"
 
     func save(_ settings: PersistedSettings) {
         guard let data = try? encoder.encode(settings) else { return }

@@ -20,6 +20,11 @@ struct RollingEnergy {
         values[nextIndex] = energy
         total += energy
         nextIndex = (nextIndex + 1) % values.count
+        // Re-sum once per window (amortized O(1)) so cancellation error from
+        // evicting loud intervals cannot accumulate during quiet passages.
+        if nextIndex == 0 {
+            total = values.reduce(0, +)
+        }
     }
 
     mutating func reset() {

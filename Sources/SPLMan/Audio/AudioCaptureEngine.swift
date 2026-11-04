@@ -251,7 +251,13 @@ private struct PairAudioBufferList {
 
 struct CompletedAudioSecond: Equatable {
     let intervalEndUTC: Date
-    let snapshot: RawMeterSnapshot
+    var snapshot: RawMeterSnapshot
+    /// Input discontinuities (dropouts, render errors) that occurred after the
+    /// previously delivered interval and before this one began. Travelling
+    /// with the interval keeps gap rows in stream order.
+    var precedingDiscontinuityEvents: UInt64 = 0
+    var precedingMissingFrames: UInt64 = 0
+    var precedingDiscardedPartialFrames: UInt64 = 0
 }
 
 struct AudioCaptureHealth: Equatable {
@@ -280,27 +286,27 @@ private final class CompletedSecondQueue {
     private var droppedCount: UInt64 = 0
     private var pendingContentionDrops: UInt64 = 0 // audio-producer owned
 
-    func offer(_ value: CompletedAudioSecond) {
+    /// Returns `false` when the interval was dropped.
+    @discardableResult
+    func offer(_ value: CompletedAudioSecond) -> Bool {
         guard lock.try() else {
             pendingContentionDrops &+= 1
-            return
+            return false
         }
         droppedCount &+= pendingContentionDrops
         pendingContentionDrops = 0
         guard count < values.count else {
             droppedCount &+= 1
             lock.unlock()
-            return
+            return false
         }
-        var adjustedSnapshot = value.snapshot
-        adjustedSnapshot.lostSecondIntervals &+= droppedCount
-        values[writeIndex] = CompletedAudioSecond(
-            intervalEndUTC: value.intervalEndUTC,
-            snapshot: adjustedSnapshot
-        )
+        var adjusted = value
+        adjusted.snapshot.lostSecondIntervals &+= droppedCount
+        values[writeIndex] = adjusted
         writeIndex = (writeIndex + 1) % values.count
         count += 1
         lock.unlock()
+        return true
     }
 
     func take() -> CompletedAudioSecond? {
@@ -483,20 +489,162 @@ enum AudioCaptureError: LocalizedError {
     }
 }
 
+/// State used by the real-time callback. One instance exists per started
+/// stream and is retained by the audio unit's refCon until the unit has been
+/// disposed, so the main thread never mutates anything the callback reads.
+private final class AudioRenderContext {
+    let unit: AudioUnit
+    let processor: SPLProcessor
+    let sampleRate: Double
+    let capturesReference: Bool
+    let latest: LatestSnapshotBox
+    let completedSeconds: CompletedSecondQueue
+    let health: AudioCaptureHealthBox
+    let spectrogramSignalTap: SpectrogramSignalTap
+
+    // Audio-thread owned.
+    private var expectedNextSampleTime: Float64?
+    private var pendingDiscontinuityEvents: UInt64 = 0
+    private var pendingMissingFrames: UInt64 = 0
+    private var pendingDiscardedPartialFrames: UInt64 = 0
+
+    init(
+        unit: AudioUnit,
+        processor: SPLProcessor,
+        sampleRate: Double,
+        capturesReference: Bool,
+        latest: LatestSnapshotBox,
+        completedSeconds: CompletedSecondQueue,
+        health: AudioCaptureHealthBox,
+        spectrogramSignalTap: SpectrogramSignalTap
+    ) {
+        self.unit = unit
+        self.processor = processor
+        self.sampleRate = sampleRate
+        self.capturesReference = capturesReference
+        self.latest = latest
+        self.completedSeconds = completedSeconds
+        self.health = health
+        self.spectrogramSignalTap = spectrogramSignalTap
+    }
+
+    func render(
+        flags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
+        timestamp: UnsafePointer<AudioTimeStamp>,
+        frameCount: UInt32
+    ) -> OSStatus {
+        var bufferList = PairAudioBufferList(
+            numberBuffers: capturesReference ? 2 : 1,
+            firstBuffer: AudioBuffer(mNumberChannels: 1, mDataByteSize: 0, mData: nil),
+            secondBuffer: AudioBuffer(mNumberChannels: 1, mDataByteSize: 0, mData: nil)
+        )
+        let status = withUnsafeMutablePointer(to: &bufferList) { pointer in
+            pointer.withMemoryRebound(to: AudioBufferList.self, capacity: 1) {
+                AudioUnitRender(unit, flags, timestamp, 1, frameCount, $0)
+            }
+        }
+        guard status == noErr else {
+            invalidateAfterRenderFailure(status)
+            return status
+        }
+        guard let data = bufferList.firstBuffer.mData?.assumingMemoryBound(to: Float.self) else {
+            invalidateAfterRenderFailure(kAudio_ParamError)
+            return kAudio_ParamError
+        }
+        let bufferStartDate = bufferStartUTC(timestamp: timestamp.pointee, frameCount: frameCount)
+        if let missingFrames = detectDiscontinuity(
+            timestamp: timestamp.pointee,
+            frameCount: frameCount
+        ) {
+            spectrogramSignalTap.discardPartialFrame()
+            let discardedFrames = processor.invalidateTimeContinuity()
+            health.recordDropout(
+                missingFrames: missingFrames,
+                discardedPartialFrames: discardedFrames
+            )
+            pendingDiscontinuityEvents &+= 1
+            pendingMissingFrames &+= missingFrames
+            pendingDiscardedPartialFrames &+= discardedFrames
+        }
+        let bufferStartHostTime = timestamp.pointee.mFlags.contains(.hostTimeValid)
+            ? timestamp.pointee.mHostTime
+            : nil
+        spectrogramSignalTap.append(
+            data,
+            referenceSamples: bufferList.secondBuffer.mData?.assumingMemoryBound(to: Float.self),
+            count: Int(frameCount),
+            bufferStartHostTime: bufferStartHostTime
+        )
+        let framesBeforeBuffer = processor.currentProcessedFrameCount
+        if let snapshot = processor.process(data, count: Int(frameCount)) {
+            latest.offer(snapshot)
+            health.update(snapshot, dspDroppedSecondCount: processor.lostSecondIntervals)
+        }
+        while let snapshot = processor.popCompletedSecond() {
+            // The interval ends at a known frame of this buffer; the buffer
+            // start is placed on the UTC wall clock, so audio-clock drift
+            // does not accumulate into the logged timestamps.
+            let endOffsetFrames = snapshot.processedFrameCount &- framesBeforeBuffer
+            let intervalEndUTC = bufferStartDate.addingTimeInterval(
+                Double(endOffsetFrames) / sampleRate
+            )
+            let delivered = completedSeconds.offer(CompletedAudioSecond(
+                intervalEndUTC: intervalEndUTC,
+                snapshot: snapshot,
+                precedingDiscontinuityEvents: pendingDiscontinuityEvents,
+                precedingMissingFrames: pendingMissingFrames,
+                precedingDiscardedPartialFrames: pendingDiscardedPartialFrames
+            ))
+            if delivered {
+                pendingDiscontinuityEvents = 0
+                pendingMissingFrames = 0
+                pendingDiscardedPartialFrames = 0
+            }
+        }
+        return noErr
+    }
+
+    private func invalidateAfterRenderFailure(_ status: OSStatus) {
+        spectrogramSignalTap.discardPartialFrame()
+        let discardedFrames = processor.invalidateTimeContinuity()
+        health.recordRenderError(status, discardedPartialFrames: discardedFrames)
+        pendingDiscontinuityEvents &+= 1
+        pendingDiscardedPartialFrames &+= discardedFrames
+        expectedNextSampleTime = nil
+    }
+
+    /// Returns the number of skipped frames when the sample time does not
+    /// continue the previous buffer.
+    private func detectDiscontinuity(timestamp: AudioTimeStamp, frameCount: UInt32) -> UInt64? {
+        guard timestamp.mFlags.contains(.sampleTimeValid) else { return nil }
+        var missingFrames: UInt64?
+        if let expectedNextSampleTime,
+           abs(timestamp.mSampleTime - expectedNextSampleTime) > 1 {
+            let skipped = timestamp.mSampleTime - expectedNextSampleTime
+            missingFrames = skipped > 0 ? UInt64(skipped.rounded()) : 0
+        }
+        expectedNextSampleTime = timestamp.mSampleTime + Float64(frameCount)
+        return missingFrames
+    }
+
+    private func bufferStartUTC(timestamp: AudioTimeStamp, frameCount: UInt32) -> Date {
+        let now = Date()
+        let nowHostTime = AudioGetCurrentHostTime()
+        if timestamp.mFlags.contains(.hostTimeValid), timestamp.mHostTime <= nowHostTime {
+            let ageNanoseconds = AudioConvertHostTimeToNanos(nowHostTime - timestamp.mHostTime)
+            return now.addingTimeInterval(-Double(ageNanoseconds) / 1_000_000_000)
+        }
+        return now.addingTimeInterval(-Double(frameCount) / sampleRate)
+    }
+}
+
 final class AudioCaptureEngine {
     let latest = LatestSnapshotBox()
     private let completedSeconds = CompletedSecondQueue()
     private let health = AudioCaptureHealthBox()
     private let spectrogramSignalTap = SpectrogramSignalTap()
     private var audioUnit: AudioUnit?
-    private var processor: SPLProcessor?
-    private var capturesReference = false
-    private var streamClockAnchorUTC: Date?
-    private var streamClockAnchorHostTime: UInt64 = 0
-    private var firstFrameUTC: Date?
-    private var expectedNextSampleTime: Float64?
-    private var pendingDiscontinuityMissingFrames: UInt64 = 0
-    private var completedSecondTimestampBase: UInt64 = 0
+    private var renderContext: Unmanaged<AudioRenderContext>?
     private var reportedClippedFrameCount: UInt64 = 0
     private var reportedDroppedSecondCount: UInt64 = 0
 
@@ -587,15 +735,25 @@ final class AudioCaptureEngine {
                 &shouldAllocate, UInt32(MemoryLayout<UInt32>.size)
             ), L10n.text("alokace audio bufferu"))
 
-            processor = SPLProcessor(sampleRate: sampleRate)
-            capturesReference = referenceChannel != nil
+            let capturesReference = referenceChannel != nil
             spectrogramSignalTap.configure(
                 sampleRate: sampleRate,
                 capturesReference: capturesReference
             )
+            let context = Unmanaged.passRetained(AudioRenderContext(
+                unit: unit,
+                processor: SPLProcessor(sampleRate: sampleRate),
+                sampleRate: sampleRate,
+                capturesReference: capturesReference,
+                latest: latest,
+                completedSeconds: completedSeconds,
+                health: health,
+                spectrogramSignalTap: spectrogramSignalTap
+            ))
+            renderContext = context
             var callback = AURenderCallbackStruct(
                 inputProc: Self.inputCallback,
-                inputProcRefCon: Unmanaged.passUnretained(self).toOpaque()
+                inputProcRefCon: context.toOpaque()
             )
             try check(AudioUnitSetProperty(
                 unit, kAudioOutputUnitProperty_SetInputCallback, kAudioUnitScope_Global, 0,
@@ -606,12 +764,6 @@ final class AudioCaptureEngine {
             health.configure(sampleRate: sampleRate)
             reportedClippedFrameCount = 0
             reportedDroppedSecondCount = 0
-            streamClockAnchorUTC = Date()
-            streamClockAnchorHostTime = AudioGetCurrentHostTime()
-            firstFrameUTC = nil
-            expectedNextSampleTime = nil
-            pendingDiscontinuityMissingFrames = 0
-            completedSecondTimestampBase = 0
             try check(AudioOutputUnitStart(unit), L10n.text("spuštění vstupu"))
         } catch {
             stop()
@@ -628,12 +780,9 @@ final class AudioCaptureEngine {
             AudioComponentInstanceDispose(unit)
         }
         audioUnit = nil
-        processor = nil
-        capturesReference = false
-        streamClockAnchorUTC = nil
-        firstFrameUTC = nil
-        expectedNextSampleTime = nil
-        pendingDiscontinuityMissingFrames = 0
+        // Released only after the unit is disposed and can no longer call back.
+        renderContext?.release()
+        renderContext = nil
         latest.clear()
         spectrogramSignalTap.clear()
     }
@@ -680,111 +829,9 @@ final class AudioCaptureEngine {
 
     private static let inputCallback: AURenderCallback = {
         context, flags, timestamp, _, frameCount, _ in
-        let engine = Unmanaged<AudioCaptureEngine>.fromOpaque(context).takeUnretainedValue()
-        guard let unit = engine.audioUnit, let processor = engine.processor else {
-            return kAudio_ParamError
-        }
-        var bufferList = PairAudioBufferList(
-            numberBuffers: engine.capturesReference ? 2 : 1,
-            firstBuffer: AudioBuffer(mNumberChannels: 1, mDataByteSize: 0, mData: nil),
-            secondBuffer: AudioBuffer(mNumberChannels: 1, mDataByteSize: 0, mData: nil)
-        )
-        let status = withUnsafeMutablePointer(to: &bufferList) { pointer in
-            pointer.withMemoryRebound(to: AudioBufferList.self, capacity: 1) {
-                AudioUnitRender(unit, flags, timestamp, 1, frameCount, $0)
-            }
-        }
-        guard status == noErr else {
-            engine.spectrogramSignalTap.discardPartialFrame()
-            let discardedFrames = processor.invalidateTimeContinuity()
-            engine.health.recordRenderError(
-                status,
-                discardedPartialFrames: discardedFrames
-            )
-            engine.prepareForNewTimeSegment(processor: processor)
-            return status
-        }
-        guard let data = bufferList.firstBuffer.mData?.assumingMemoryBound(to: Float.self) else {
-            engine.spectrogramSignalTap.discardPartialFrame()
-            let discardedFrames = processor.invalidateTimeContinuity()
-            engine.health.recordRenderError(
-                kAudio_ParamError,
-                discardedPartialFrames: discardedFrames
-            )
-            engine.prepareForNewTimeSegment(processor: processor)
-            return kAudio_ParamError
-        }
-        if engine.updateStreamTiming(timestamp: timestamp.pointee, frameCount: frameCount) {
-            engine.spectrogramSignalTap.discardPartialFrame()
-            let discardedFrames = processor.invalidateTimeContinuity()
-            engine.health.recordDropout(
-                missingFrames: engine.pendingDiscontinuityMissingFrames,
-                discardedPartialFrames: discardedFrames
-            )
-            engine.completedSecondTimestampBase = processor.currentCompletedSecondCount
-        }
-        let bufferStartHostTime = timestamp.pointee.mFlags.contains(.hostTimeValid)
-            ? timestamp.pointee.mHostTime
-            : nil
-        engine.spectrogramSignalTap.append(
-            data,
-            referenceSamples: bufferList.secondBuffer.mData?.assumingMemoryBound(to: Float.self),
-            count: Int(frameCount),
-            bufferStartHostTime: bufferStartHostTime
-        )
-        if let snapshot = processor.process(data, count: Int(frameCount)) {
-            engine.latest.offer(snapshot)
-            engine.health.update(snapshot, dspDroppedSecondCount: processor.lostSecondIntervals)
-        }
-        while let snapshot = processor.popCompletedSecond() {
-            guard let firstFrameUTC = engine.firstFrameUTC ?? engine.streamClockAnchorUTC else {
-                engine.health.recordRenderError(kAudio_ParamError)
-                continue
-            }
-            let intervalEndUTC = firstFrameUTC.addingTimeInterval(
-                TimeInterval(snapshot.completedSecondCount - engine.completedSecondTimestampBase)
-            )
-            engine.completedSeconds.offer(CompletedAudioSecond(
-                intervalEndUTC: intervalEndUTC,
-                snapshot: snapshot
-            ))
-        }
-        return noErr
-    }
-
-    private func updateStreamTiming(timestamp: AudioTimeStamp, frameCount: UInt32) -> Bool {
-        if firstFrameUTC == nil { firstFrameUTC = utcDate(for: timestamp) }
-        if firstFrameUTC == nil { firstFrameUTC = streamClockAnchorUTC }
-
-        guard timestamp.mFlags.contains(.sampleTimeValid) else { return false }
-        var discontinuity = false
-        if let expectedNextSampleTime,
-           abs(timestamp.mSampleTime - expectedNextSampleTime) > 1 {
-            let skipped = timestamp.mSampleTime - expectedNextSampleTime
-            let missingFrames = skipped > 0 ? UInt64(skipped.rounded()) : 0
-            pendingDiscontinuityMissingFrames = missingFrames
-            firstFrameUTC = utcDate(for: timestamp) ?? streamClockAnchorUTC
-            discontinuity = true
-        }
-        expectedNextSampleTime = timestamp.mSampleTime + Float64(frameCount)
-        return discontinuity
-    }
-
-    private func prepareForNewTimeSegment(processor: SPLProcessor) {
-        firstFrameUTC = nil
-        expectedNextSampleTime = nil
-        pendingDiscontinuityMissingFrames = 0
-        completedSecondTimestampBase = processor.currentCompletedSecondCount
-    }
-
-    private func utcDate(for timestamp: AudioTimeStamp) -> Date? {
-        guard let anchorUTC = streamClockAnchorUTC,
-              timestamp.mFlags.contains(.hostTimeValid) else { return nil }
-        guard timestamp.mHostTime >= streamClockAnchorHostTime else { return anchorUTC }
-        let nanoseconds = AudioConvertHostTimeToNanos(
-            timestamp.mHostTime - streamClockAnchorHostTime
-        )
-        return anchorUTC.addingTimeInterval(Double(nanoseconds) / 1_000_000_000)
+        Unmanaged<AudioRenderContext>.fromOpaque(context)
+            .takeUnretainedValue()
+            .render(flags: flags, timestamp: timestamp, frameCount: frameCount)
     }
 
     private func nominalSampleRate(deviceID: AudioDeviceID) throws -> Double {

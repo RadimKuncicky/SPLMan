@@ -40,6 +40,9 @@ enum SelfTest {
         testRecordingIntervalBoundary(&failures)
         testDisplayedAudioDropoutCount(&failures)
         testDiscontinuityGapTiming(&failures)
+        testSequenceGapTiming(&failures)
+        testRollingEnergyPrecision(&failures)
+        testSettingsKeepCalibrationsOnPartialDecodeFailure(&failures)
         testRecordingEventHistory(&failures)
         failures.append(contentsOf: LocalizationValidation.run())
         if !DSPValidation.run() {
@@ -160,9 +163,29 @@ enum SelfTest {
     }
 
     private static func testCalibration(_ failures: inout [String]) {
+        var settling = CalibrationSession()
+        var settlingCalibrated = false
+        defer {
+            if !settlingCalibrated {
+                failures.append("Calibration did not finish after the A-Slow settling transient")
+            }
+        }
+        for index in 0..<(CalibrationSession.settlingSamples + CalibrationSession.requiredSamples) {
+            // A-Slow rising from zero after the engine restart (10 Hz snapshots).
+            let level = -20 + 10 * log10(1 - exp(-Double(index + 1) * 0.1))
+            let result = settling.add(rawASlowDB: level, rawCSlowDB: level, toneConcentration: 0.95)
+            if case let .calibrated(offset) = result {
+                settlingCalibrated = true
+                if abs(offset - 114) > 0.02 {
+                    failures.append("Calibration accepted the A-Slow settling transient")
+                }
+                break
+            }
+        }
+
         var stable = CalibrationSession()
         var stableResult: CalibrationSession.Result = .collecting(progress: 0)
-        for index in 0..<CalibrationSession.requiredSamples {
+        for index in 0..<(CalibrationSession.settlingSamples + CalibrationSession.requiredSamples) {
             let level = -20 + (index.isMultiple(of: 2) ? 0.1 : -0.1)
             stableResult = stable.add(
                 rawASlowDB: level,
@@ -429,6 +452,86 @@ enum SelfTest {
             || backward.endedAt != Date(timeIntervalSince1970: 1_019)
             || backward.lostSecondIntervals != 1 {
             failures.append("Backward audio clock reset was not preserved as an explicit gap")
+        }
+    }
+
+    private static func testSequenceGapTiming(_ failures: inout [String]) {
+        let sessionID = UUID()
+        let midRecording = CompletedSecondRecorder.makeSequenceGap(
+            sessionID: sessionID,
+            lastIntervalEnd: Date(timeIntervalSince1970: 1_010),
+            nextIntervalStart: Date(timeIntervalSince1970: 1_013),
+            lostSecondIntervals: 3,
+            atRecordingStart: false
+        )
+        if midRecording.startedAt != Date(timeIntervalSince1970: 1_010)
+            || midRecording.endedAt != Date(timeIntervalSince1970: 1_013)
+            || midRecording.lostSecondIntervals != 3
+            || !midRecording.reason.contains("overflow") {
+            failures.append("Mid-recording dropped intervals did not produce a bounded gap")
+        }
+
+        let atStart = CompletedSecondRecorder.makeSequenceGap(
+            sessionID: sessionID,
+            lastIntervalEnd: Date(timeIntervalSince1970: 1_012.5),
+            nextIntervalStart: Date(timeIntervalSince1970: 1_013),
+            lostSecondIntervals: 3,
+            atRecordingStart: true
+        )
+        if atStart.startedAt != Date(timeIntervalSince1970: 1_012.5)
+            || atStart.startedAt > atStart.endedAt {
+            failures.append("Recording-start sequence gap began before the session")
+        }
+    }
+
+    private static func testRollingEnergyPrecision(_ failures: inout [String]) {
+        var rolling = RollingEnergy(capacity: 60)
+        for index in 0..<60 { rolling.append(100 + Double(index) * 0.37) }
+        for _ in 0..<60 { rolling.append(1e-10) }
+        guard let average = rolling.average,
+              abs(average - 1e-10) / 1e-10 < 1e-9 else {
+            failures.append("Rolling energy kept cancellation error after loud intervals left the window")
+            return
+        }
+    }
+
+    private static func testSettingsKeepCalibrationsOnPartialDecodeFailure(
+        _ failures: inout [String]
+    ) {
+        var settings = PersistedSettings()
+        let key = CalibrationKey(deviceUID: "device", channel: 1)
+        let record = CalibrationRecord(
+            offsetDB: 113.4,
+            calibratedAt: Date(timeIntervalSince1970: 1_000)
+        )
+        settings.calibrations[key] = record
+        settings.spectrogram.displayMode = .spectrogram
+        do {
+            let data = try PropertyListEncoder().encode(settings)
+            guard var root = try PropertyListSerialization.propertyList(
+                from: data,
+                format: nil
+            ) as? [String: Any],
+                  var spectrogram = root["spectrogram"] as? [String: Any] else {
+                failures.append("Settings test could not inspect the encoded property list")
+                return
+            }
+            spectrogram["displayMode"] = "valueFromNewerVersion"
+            root["spectrogram"] = spectrogram
+            let corrupted = try PropertyListSerialization.data(
+                fromPropertyList: root,
+                format: .binary,
+                options: 0
+            )
+            let decoded = try PropertyListDecoder().decode(PersistedSettings.self, from: corrupted)
+            if decoded.calibrations[key] != record {
+                failures.append("Unreadable analysis setting discarded stored calibrations")
+            }
+            if decoded.spectrogram != SpectrogramSettings() {
+                failures.append("Unreadable analysis settings were not reset to defaults")
+            }
+        } catch {
+            failures.append("Settings with one unreadable field failed to decode: \(error)")
         }
     }
 

@@ -413,7 +413,7 @@ final class MeterModel: ObservableObject {
         }
         if self.calibrationSession != nil,
            let calibrationStartedAt,
-           now.timeIntervalSince(calibrationStartedAt) > 12 {
+           now.timeIntervalSince(calibrationStartedAt) > CalibrationSession.timeout {
             finishCalibration(
                 status: L10n.text("Kalibrace selhala: na vybraném kanálu není platný signál 94 dB / 1 kHz.")
             )
@@ -610,7 +610,7 @@ final class MeterModel: ObservableObject {
 
     private func checkAudioTimeouts() {
         if let calibrationStartedAt,
-           now.timeIntervalSince(calibrationStartedAt) > 12 {
+           now.timeIntervalSince(calibrationStartedAt) > CalibrationSession.timeout {
             finishCalibration(
                 status: L10n.text("Kalibrace selhala: na vybraném kanálu není platný signál 94 dB / 1 kHz.")
             )

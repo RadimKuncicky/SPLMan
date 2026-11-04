@@ -9,8 +9,15 @@ struct CalibrationSession {
     }
 
     static let targetDB = 94.0
+    /// Snapshots arrive at 10 Hz from a freshly started processor whose
+    /// A-Slow integrator (τ = 1 s) begins at zero energy. Six seconds (6τ)
+    /// leave a settling error below 0.011 dB; accepting earlier windows
+    /// biased the offset by about +0.2 dB.
+    static let settlingSamples = 60
     static let requiredSamples = 30
-    static let maximumSamples = 100
+    static let maximumSamples = settlingSamples + 100
+    /// Wall-clock limit for the UI; snapshots may be dropped, never added.
+    static let timeout: TimeInterval = 20
     static let maximumSpreadDB = 0.6
     static let minimumRawLevelDB = -70.0
     static let minimumToneConcentration = 0.65
@@ -26,6 +33,12 @@ struct CalibrationSession {
         toneConcentration: Double
     ) -> Result {
         receivedSampleCount += 1
+        guard receivedSampleCount > Self.settlingSamples else {
+            return .collecting(
+                progress: Double(receivedSampleCount)
+                    / Double(Self.settlingSamples + Self.requiredSamples)
+            )
+        }
         aSamples.append(rawASlowDB)
         cSamples.append(rawCSlowDB)
         toneConcentrations.append(toneConcentration)
@@ -35,7 +48,10 @@ struct CalibrationSession {
             toneConcentrations.removeFirst()
         }
         guard aSamples.count >= Self.requiredSamples else {
-            return .collecting(progress: Double(aSamples.count) / Double(Self.requiredSamples))
+            return .collecting(
+                progress: Double(Self.settlingSamples + aSamples.count)
+                    / Double(Self.settlingSamples + Self.requiredSamples)
+            )
         }
         let minimum = aSamples.min() ?? rawASlowDB
         let maximum = aSamples.max() ?? rawASlowDB

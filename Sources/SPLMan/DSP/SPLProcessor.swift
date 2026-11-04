@@ -162,6 +162,7 @@ final class SPLProcessor {
     private var queuedSecondCount = 0
 
     var currentCompletedSecondCount: UInt64 { completedSecondCount }
+    var currentProcessedFrameCount: UInt64 { processedFrameCount }
 
     static func isValidSampleRate(_ sampleRate: Double) -> Bool {
         sampleRate.isFinite

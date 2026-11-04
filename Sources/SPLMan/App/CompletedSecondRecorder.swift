@@ -24,9 +24,13 @@ final class CompletedSecondRecorder: @unchecked Sendable {
     private var lastTimestamp: Date?
     private var hasAppendedSample = false
     private var pendingDroppedIntervals: UInt64 = 0
-    private var pendingMissingFrames: UInt64 = 0
-    private var pendingDiscardedPartialFrames: UInt64 = 0
-    private var pendingDiscontinuityEvents: UInt64 = 0
+    // Discontinuities reported by health events but not yet carried by a
+    // delivered interval. Gap rows are written from the interval-attached
+    // counts so they stay in stream order; only a remainder at stop() becomes
+    // a trailing gap.
+    private var unattributedDiscontinuityEvents: Int64 = 0
+    private var unattributedMissingFrames: Int64 = 0
+    private var unattributedDiscardedPartialFrames: Int64 = 0
     private var dropoutCount = 0
     private var clippingDetected = false
     private var exceededLimits: Set<Metric> = []
@@ -152,9 +156,9 @@ final class CompletedSecondRecorder: @unchecked Sendable {
                 type: .audioDropout,
                 metadata: metadata
             ), onError: onError)
-            pendingMissingFrames &+= health.missingFrameCount
-            pendingDiscardedPartialFrames &+= health.discardedPartialFrameCount
-            pendingDiscontinuityEvents &+= health.audioDropoutCount + health.renderErrorCount
+            unattributedDiscontinuityEvents &+= Int64(clamping: increment)
+            unattributedMissingFrames &+= Int64(clamping: health.missingFrameCount)
+            unattributedDiscardedPartialFrames &+= Int64(clamping: health.discardedPartialFrameCount)
         }
         if health.droppedSecondIntervalCount > 0 {
             pendingDroppedIntervals &+= health.droppedSecondIntervalCount
@@ -179,25 +183,35 @@ final class CompletedSecondRecorder: @unchecked Sendable {
 
     private func append(_ completed: CompletedAudioSecond) {
         let raw = completed.snapshot
-        appendPendingDiscontinuityGap(
-            nextIntervalStart: completed.intervalEndUTC.addingTimeInterval(-1)
-        )
+        let intervalStart = completed.intervalEndUTC.addingTimeInterval(-1)
+        if completed.precedingDiscontinuityEvents > 0 {
+            unattributedDiscontinuityEvents &-= Int64(clamping: completed.precedingDiscontinuityEvents)
+            unattributedMissingFrames &-= Int64(clamping: completed.precedingMissingFrames)
+            unattributedDiscardedPartialFrames &-= Int64(clamping: completed.precedingDiscardedPartialFrames)
+            // A discontinuity before the first full post-REC interval is
+            // already covered by the initial partial-second exclusion.
+            if hasAppendedSample || intervalStart >= sessionStartedAt {
+                logger.appendGap(Self.makeDiscontinuityGap(
+                    sessionID: sessionID,
+                    lastIntervalEnd: lastTimestamp,
+                    nextIntervalStart: intervalStart,
+                    sessionStartedAt: sessionStartedAt,
+                    eventCount: completed.precedingDiscontinuityEvents,
+                    missingFrameCount: completed.precedingMissingFrames,
+                    discardedPartialFrameCount: completed.precedingDiscardedPartialFrames
+                ), onError: onError)
+            }
+        }
         if let previous = lastCompletedSecondCount,
            raw.completedSecondCount > previous + 1 {
             let sequenceGap = raw.completedSecondCount - previous - 1
-            if !hasAppendedSample {
-                let gapEnd = completed.intervalEndUTC.addingTimeInterval(-1)
-                logger.appendGap(MeasurementGap(
-                    sessionID: sessionID,
-                    startedAt: max(
-                        sessionStartedAt,
-                        gapEnd.addingTimeInterval(-Double(sequenceGap))
-                    ),
-                    endedAt: gapEnd,
-                    lostSecondIntervals: sequenceGap,
-                    reason: "Missing completed-second samples at recording start"
-                ), onError: onError)
-            }
+            logger.appendGap(Self.makeSequenceGap(
+                sessionID: sessionID,
+                lastIntervalEnd: lastTimestamp ?? sessionStartedAt,
+                nextIntervalStart: intervalStart,
+                lostSecondIntervals: sequenceGap,
+                atRecordingStart: !hasAppendedSample
+            ), onError: onError)
             pendingDroppedIntervals = pendingDroppedIntervals > sequenceGap
                 ? pendingDroppedIntervals - sequenceGap : 0
         }
@@ -349,11 +363,29 @@ final class CompletedSecondRecorder: @unchecked Sendable {
     }
 
     private func appendTrailingGapIfNeeded() {
-        appendPendingDiscontinuityGap(nextIntervalStart: Date())
-        guard pendingDroppedIntervals > 0 else { return }
         let endedAt = Date()
-        let startedAt = lastTimestamp?.addingTimeInterval(1)
-            ?? endedAt.addingTimeInterval(-Double(pendingDroppedIntervals))
+        if unattributedDiscontinuityEvents > 0 {
+            logger.appendGap(Self.makeDiscontinuityGap(
+                sessionID: sessionID,
+                lastIntervalEnd: lastTimestamp,
+                nextIntervalStart: endedAt,
+                sessionStartedAt: sessionStartedAt,
+                eventCount: UInt64(unattributedDiscontinuityEvents),
+                missingFrameCount: UInt64(max(0, unattributedMissingFrames)),
+                discardedPartialFrameCount: UInt64(max(0, unattributedDiscardedPartialFrames))
+            ), onError: onError)
+        }
+        unattributedDiscontinuityEvents = 0
+        unattributedMissingFrames = 0
+        unattributedDiscardedPartialFrames = 0
+
+        guard pendingDroppedIntervals > 0 else { return }
+        // `lastTimestamp` is the end of the last logged interval, which is
+        // where the undelivered intervals begin.
+        let startedAt = min(
+            endedAt,
+            lastTimestamp ?? endedAt.addingTimeInterval(-Double(pendingDroppedIntervals))
+        )
         logger.appendGap(MeasurementGap(
             sessionID: sessionID,
             startedAt: startedAt,
@@ -362,22 +394,6 @@ final class CompletedSecondRecorder: @unchecked Sendable {
             reason: "Completed-second buffer overflow"
         ), onError: onError)
         pendingDroppedIntervals = 0
-    }
-
-    private func appendPendingDiscontinuityGap(nextIntervalStart: Date) {
-        guard pendingDiscontinuityEvents > 0 else { return }
-        logger.appendGap(Self.makeDiscontinuityGap(
-            sessionID: sessionID,
-            lastIntervalEnd: lastTimestamp,
-            nextIntervalStart: nextIntervalStart,
-            sessionStartedAt: sessionStartedAt,
-            eventCount: pendingDiscontinuityEvents,
-            missingFrameCount: pendingMissingFrames,
-            discardedPartialFrameCount: pendingDiscardedPartialFrames
-        ), onError: onError)
-        pendingMissingFrames = 0
-        pendingDiscardedPartialFrames = 0
-        pendingDiscontinuityEvents = 0
     }
 
     private func calibrated(_ value: Double?) -> Double? {
@@ -407,6 +423,33 @@ final class CompletedSecondRecorder: @unchecked Sendable {
         sessionStartedAt: Date
     ) -> Bool {
         intervalEndUTC.addingTimeInterval(-1) >= sessionStartedAt
+    }
+
+    /// Gap for completed-second intervals that were dropped (DSP or handoff
+    /// queue overflow) between two delivered intervals.
+    static func makeSequenceGap(
+        sessionID: UUID,
+        lastIntervalEnd: Date,
+        nextIntervalStart: Date,
+        lostSecondIntervals: UInt64,
+        atRecordingStart: Bool
+    ) -> MeasurementGap {
+        let startedAt = min(
+            nextIntervalStart,
+            max(
+                lastIntervalEnd,
+                nextIntervalStart.addingTimeInterval(-Double(lostSecondIntervals))
+            )
+        )
+        return MeasurementGap(
+            sessionID: sessionID,
+            startedAt: startedAt,
+            endedAt: nextIntervalStart,
+            lostSecondIntervals: lostSecondIntervals,
+            reason: atRecordingStart
+                ? "Missing completed-second samples at recording start"
+                : "Completed-second buffer overflow"
+        )
     }
 
     static func makeDiscontinuityGap(

@@ -480,7 +480,7 @@ final class SpectrogramAnalyzer: @unchecked Sendable {
             let bounds = nominalSmoothingFrequencyBounds(centerFrequency: centerFrequency)
             let lowBin = max(1, Int(floor(bounds.lower / binWidth - 0.5)))
             let highBin = min(lastBin, Int(ceil(bounds.upper / binWidth + 0.5)))
-            guard lowBin <= highBin else { return 0 }
+            guard lowBin <= highBin else { return -200 }
 
             var bandPower = 0.0
             for bin in lowBin...highBin {
