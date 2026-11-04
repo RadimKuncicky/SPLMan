@@ -10,5 +10,7 @@ if CommandLine.arguments.contains("--localization-probe") {
     let delegate = AppDelegate()
     application.delegate = delegate
     application.setActivationPolicy(.regular)
-    application.run()
+    withExtendedLifetime(delegate) {
+        application.run()
+    }
 }

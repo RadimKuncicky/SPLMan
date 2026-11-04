@@ -25,6 +25,11 @@ final class MeterModel: ObservableObject {
     @Published private(set) var isEventHistoryLoading = false
     @Published private(set) var isEventHistoryTruncated = false
     @Published private(set) var eventHistoryError: String?
+    @Published private(set) var spectrogramColumns: [SpectrogramColumn] = []
+    @Published private(set) var transferFunctionAnalysis = TransferFunctionAnalysis(
+        validity: .waitingForSignal,
+        curve: nil
+    )
     @Published var recordingMetadata: RecordingMetadataDraft {
         didSet { historyStore.saveMetadata(recordingMetadata) }
     }
@@ -41,11 +46,27 @@ final class MeterModel: ObservableObject {
     @Published var settings: PersistedSettings {
         didSet {
             store.save(settings)
-            guard oldValue.displayedMetrics != settings.displayedMetrics else { return }
-            secondRecorder?.updateConfiguration(
-                alarmSettings: alarmSettings,
-                displayedMetrics: settings.displayedMetrics
-            )
+            if oldValue.displayedMetrics != settings.displayedMetrics {
+                secondRecorder?.updateConfiguration(
+                    alarmSettings: alarmSettings,
+                    displayedMetrics: settings.displayedMetrics
+                )
+            }
+            if oldValue.spectrogram.displayMode != settings.spectrogram.displayMode {
+                engine.setSpectrogramCaptureEnabled(settings.spectrogram.displayMode != .none)
+                clearSpectrogramHistory()
+            } else if oldValue.spectrogram.frequencyRange
+                != settings.spectrogram.frequencyRange {
+                clearSpectrogramHistory()
+            }
+            if oldValue.spectrogram.historyDuration
+                != settings.spectrogram.historyDuration {
+                trimSpectrogramHistory()
+            }
+            if oldValue.spectrogram.referenceChannel
+                != settings.spectrogram.referenceChannel {
+                clearTransferFunction()
+            }
         }
     }
 
@@ -53,6 +74,9 @@ final class MeterModel: ObservableObject {
     private let recordingErrorStore: RecordingErrorStore
     private let historyStore: RecordingHistoryStore
     private let engine = AudioCaptureEngine()
+    private let spectrogramAnalyzer = SpectrogramAnalyzer()
+    private let transferFunctionAnalyzer = TransferFunctionAnalyzer()
+    private var transferFunctionDisplayState = TransferFunctionDisplayState()
     private var timer: Timer?
     private var calibrationSession: CalibrationSession?
     private var lastDeviceScan = Date.distantPast
@@ -77,6 +101,7 @@ final class MeterModel: ObservableObject {
         recordingMetadata = historyStore.loadMetadata()
         alarmSettings = historyStore.loadAlarmSettings()
         recordingHistory = historyStore.loadHistory()
+        engine.setSpectrogramCaptureEnabled(settings.spectrogram.displayMode != .none)
         refreshDevices()
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.consumeAudioSnapshot() }
@@ -96,8 +121,22 @@ final class MeterModel: ObservableObject {
         return settings.calibrations[CalibrationKey(deviceUID: input.deviceUID, channel: input.channel)]
     }
 
+    var activeReferenceChannel: Int? {
+        guard let referenceChannel = settings.spectrogram.referenceChannel,
+              let input = settings.input,
+              let device = selectedDevice,
+              referenceChannel >= 0,
+              referenceChannel < device.inputChannelCount,
+              referenceChannel != input.channel else { return nil }
+        return referenceChannel
+    }
+
     var canStartRecording: Bool {
         isRunning && selectedCalibration != nil && calibrationSession == nil
+    }
+
+    var canReconfigureAnalysisInput: Bool {
+        !isRecording && !isPreparingRecording
     }
 
     var operationalStatus: MeterOperationalStatus {
@@ -135,6 +174,7 @@ final class MeterModel: ObservableObject {
         ])
         stopRecording()
         settings.input = InputSelection(deviceUID: device.uid, channel: 0)
+        settings.spectrogram.referenceChannel = nil
         snapshot = .empty
         startSelectedInput()
     }
@@ -151,8 +191,35 @@ final class MeterModel: ObservableObject {
         stopRecording()
         input.channel = channel
         settings.input = input
+        if settings.spectrogram.referenceChannel == channel {
+            settings.spectrogram.referenceChannel = (0..<device.inputChannelCount)
+                .first { $0 != channel }
+        }
         snapshot = .empty
         startSelectedInput()
+    }
+
+    func setAnalysisDisplayMode(_ mode: AnalysisDisplayMode) {
+        guard settings.spectrogram.displayMode != mode else { return }
+        settings.spectrogram.displayMode = mode
+    }
+
+    func cycleAnalysisDisplayMode() {
+        setAnalysisDisplayMode(settings.spectrogram.displayMode.next)
+    }
+
+    func selectReferenceChannel(_ channel: Int?) {
+        guard canReconfigureAnalysisInput else { return }
+        guard let input = settings.input, channel != input.channel else { return }
+        if let channel {
+            guard let device = selectedDevice,
+                  channel >= 0,
+                  channel < device.inputChannelCount else { return }
+        }
+        guard settings.spectrogram.referenceChannel != channel else { return }
+        settings.spectrogram.referenceChannel = channel
+        clearTransferFunction()
+        if isRunning { startSelectedInput() }
     }
 
     func toggleMetric(_ metric: Metric) {
@@ -194,6 +261,7 @@ final class MeterModel: ObservableObject {
             return
         }
         snapshot = .empty
+        clearSpectrogramHistory()
         calibrationSession = CalibrationSession()
         calibrationStartedAt = Date()
         audioStartedAt = Date()
@@ -207,6 +275,7 @@ final class MeterModel: ObservableObject {
         calibrationSession = nil
         calibrationProgress = nil
         snapshot = .empty
+        clearSpectrogramHistory()
         audioDropoutCount = 0
         isClippingDetected = false
         exceededLimits = []
@@ -219,7 +288,7 @@ final class MeterModel: ObservableObject {
             return
         }
         do {
-            try engine.start(selection: input)
+            try engine.start(selection: input, referenceChannel: activeReferenceChannel)
             isRunning = true
             audioStartedAt = Date()
             lastAudioSnapshotAt = nil
@@ -285,6 +354,7 @@ final class MeterModel: ObservableObject {
         lastAudioSnapshotAt = nil
         isRunning = false
         snapshot = .empty
+        clearSpectrogramHistory()
         self.status = status
     }
 
@@ -304,6 +374,8 @@ final class MeterModel: ObservableObject {
                 return
             }
         }
+        consumeAnalysisSignalFrames()
+        expireTransferFunctionCurve()
         guard let raw = engine.latest.take() else {
             checkAudioTimeouts()
             return
@@ -372,6 +444,108 @@ final class MeterModel: ObservableObject {
         if let value = raw.lcPeak { values[.lcPeak] = value + offset }
         if let value = raw.lafMax { values[.lafMax] = value + offset }
         snapshot = MeterSnapshot(values: values)
+    }
+
+    private func consumeAnalysisSignalFrames() {
+        let displayMode = settings.spectrogram.displayMode
+        guard displayMode != .none else { return }
+        let frames = engine.takeAnalysisSignalFrames()
+        guard !frames.isEmpty else { return }
+        let frequencyRange = settings.spectrogram.frequencyRange
+
+        if displayMode.showsSpectrogram,
+           spectrogramAnalyzer.canAcceptAnalysis {
+            spectrogramAnalyzer.analyze(
+                frames.map {
+                    SpectrogramSignalFrame(
+                        samples: $0.samples,
+                        sampleRate: $0.sampleRate,
+                        capturedAtUptime: $0.capturedAtUptime
+                    )
+                },
+                range: frequencyRange
+            ) { [weak self] columns in
+                guard let self,
+                      self.isRunning,
+                      self.settings.spectrogram.displayMode.showsSpectrogram,
+                      self.settings.spectrogram.frequencyRange == frequencyRange else { return }
+                self.spectrogramColumns.append(contentsOf: columns)
+                self.trimSpectrogramHistory()
+            }
+        }
+
+        if displayMode.showsTransferFunction,
+           activeReferenceChannel != nil {
+            let transferFrames = frames.compactMap { frame -> TransferSignalFrame? in
+                guard let reference = frame.referenceSamples else { return nil }
+                return TransferSignalFrame(
+                    measurement: frame.samples,
+                    reference: reference,
+                    sampleRate: frame.sampleRate,
+                    capturedAtUptime: frame.capturedAtUptime
+                )
+            }
+            if let latestFrame = transferFrames.last,
+               latestFrame.measurement.count == latestFrame.reference.count,
+               !latestFrame.measurement.isEmpty,
+               latestFrame.sampleRate.isFinite,
+               latestFrame.sampleRate > 0 {
+                let capturedEndUptime = latestFrame.capturedAtUptime
+                    + Double(latestFrame.measurement.count) / latestFrame.sampleRate
+                transferFunctionDisplayState.noteInputActivity(
+                    capturedAtUptime: capturedEndUptime
+                )
+            }
+            transferFunctionAnalyzer.analyze(
+                transferFrames,
+                range: frequencyRange
+            ) { [weak self] analysis in
+                guard let self,
+                      self.isRunning,
+                      self.settings.spectrogram.displayMode.showsTransferFunction,
+                      self.activeReferenceChannel != nil,
+                      self.settings.spectrogram.frequencyRange == frequencyRange else { return }
+                self.transferFunctionAnalysis = self.transferFunctionDisplayState.update(
+                    with: analysis,
+                    at: ProcessInfo.processInfo.systemUptime
+                )
+            }
+        }
+    }
+
+    private func clearSpectrogramHistory() {
+        spectrogramAnalyzer.invalidate()
+        spectrogramColumns.removeAll(keepingCapacity: true)
+        clearTransferFunction()
+    }
+
+    private func clearTransferFunction() {
+        transferFunctionAnalyzer.invalidate()
+        transferFunctionDisplayState.reset()
+        transferFunctionAnalysis = TransferFunctionAnalysis(
+            validity: .waitingForSignal,
+            curve: nil
+        )
+    }
+
+    private func expireTransferFunctionCurve(
+        referenceUptime: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) {
+        guard let expiredAnalysis = transferFunctionDisplayState.expire(
+            at: referenceUptime
+        ) else { return }
+        transferFunctionAnalysis = expiredAnalysis
+    }
+
+    private func trimSpectrogramHistory(
+        referenceUptime: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) {
+        let expiredCount = SpectrogramTimeline.expiredPrefixCount(
+            in: spectrogramColumns,
+            referenceUptime: referenceUptime,
+            historyDuration: TimeInterval(settings.spectrogram.historyDuration.rawValue)
+        )
+        if expiredCount > 0 { spectrogramColumns.removeFirst(expiredCount) }
     }
 
     func revealRecording(_ entry: RecordingHistoryEntry) {
@@ -471,6 +645,7 @@ final class MeterModel: ObservableObject {
         calibrationStartedAt = nil
         calibrationProgress = nil
         snapshot = .empty
+        clearSpectrogramHistory()
         isRunning = false
         audioStartedAt = nil
         lastAudioSnapshotAt = nil

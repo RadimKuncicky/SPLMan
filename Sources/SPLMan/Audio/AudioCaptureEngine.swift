@@ -29,6 +29,226 @@ final class LatestSnapshotBox {
     }
 }
 
+/// Fixed-capacity handoff for optional spectrum analysis. The audio callback
+/// uses `try()` and only copies samples; transforms happen on a utility queue.
+private final class SpectrogramSignalTap {
+    private static let queueCapacity = 4
+    private let lock = NSLock()
+    private var accumulation = [Float](
+        repeating: 0,
+        count: SpectrogramAnalyzer.maximumFrameCount
+    )
+    private var queuedFrames = [Float](
+        repeating: 0,
+        count: SpectrogramAnalyzer.maximumFrameCount * queueCapacity
+    )
+    private var referenceAccumulation = [Float](
+        repeating: 0,
+        count: SpectrogramAnalyzer.maximumFrameCount
+    )
+    private var queuedReferenceFrames = [Float](
+        repeating: 0,
+        count: SpectrogramAnalyzer.maximumFrameCount * queueCapacity
+    )
+    private var queuedStartHostTimes = [UInt64](repeating: 0, count: queueCapacity)
+    private var frameCapacity = 0
+    private var accumulatedCount = 0
+    private var accumulationStartHostTime: UInt64 = 0
+    private var readIndex = 0
+    private var writeIndex = 0
+    private var queuedCount = 0
+    private var isEnabled = false
+    private var capturesReference = false
+    private var sampleRate: Double?
+    private var pendingAppendDrop = false // audio-producer owned
+
+    func setEnabled(_ enabled: Bool) {
+        lock.lock()
+        isEnabled = enabled
+        resetBuffers()
+        lock.unlock()
+    }
+
+    func configure(sampleRate: Double, capturesReference: Bool) {
+        lock.lock()
+        self.sampleRate = sampleRate
+        self.capturesReference = capturesReference
+        frameCapacity = SpectrogramAnalyzer.frameCount(forSampleRate: sampleRate)
+        resetBuffers()
+        lock.unlock()
+    }
+
+    func append(
+        _ samples: UnsafePointer<Float>,
+        referenceSamples: UnsafePointer<Float>?,
+        count: Int,
+        bufferStartHostTime: UInt64?
+    ) {
+        guard lock.try() else {
+            pendingAppendDrop = true
+            return
+        }
+        defer { lock.unlock() }
+        if pendingAppendDrop {
+            accumulatedCount = 0
+            accumulationStartHostTime = 0
+            pendingAppendDrop = false
+        }
+        guard isEnabled,
+              frameCapacity > 0,
+              let sampleRate,
+              let bufferStartHostTime,
+              !capturesReference || referenceSamples != nil else {
+            accumulatedCount = 0
+            accumulationStartHostTime = 0
+            return
+        }
+
+        var sourceOffset = 0
+        while sourceOffset < count {
+            if accumulatedCount == 0 {
+                let offsetNanoseconds = UInt64(
+                    Double(sourceOffset) / sampleRate * 1_000_000_000
+                )
+                accumulationStartHostTime = bufferStartHostTime
+                    &+ AudioConvertNanosToHostTime(offsetNanoseconds)
+            }
+            let copyCount = min(frameCapacity - accumulatedCount, count - sourceOffset)
+            accumulation.withUnsafeMutableBufferPointer { destination in
+                destination.baseAddress?.advanced(by: accumulatedCount).update(
+                    from: samples.advanced(by: sourceOffset),
+                    count: copyCount
+                )
+            }
+            if let referenceSamples {
+                referenceAccumulation.withUnsafeMutableBufferPointer { destination in
+                    destination.baseAddress?.advanced(by: accumulatedCount).update(
+                        from: referenceSamples.advanced(by: sourceOffset),
+                        count: copyCount
+                    )
+                }
+            }
+            accumulatedCount += copyCount
+            sourceOffset += copyCount
+            if accumulatedCount == frameCapacity {
+                if queuedCount == Self.queueCapacity {
+                    readIndex = (readIndex + 1) % Self.queueCapacity
+                    queuedCount -= 1
+                }
+                let destinationOffset = writeIndex * SpectrogramAnalyzer.maximumFrameCount
+                queuedFrames.withUnsafeMutableBufferPointer { destination in
+                    accumulation.withUnsafeBufferPointer { source in
+                        destination.baseAddress?.advanced(by: destinationOffset).update(
+                            from: source.baseAddress!,
+                            count: frameCapacity
+                        )
+                    }
+                }
+                if capturesReference {
+                    queuedReferenceFrames.withUnsafeMutableBufferPointer { destination in
+                        referenceAccumulation.withUnsafeBufferPointer { source in
+                            destination.baseAddress?.advanced(by: destinationOffset).update(
+                                from: source.baseAddress!,
+                                count: frameCapacity
+                            )
+                        }
+                    }
+                }
+                queuedStartHostTimes[writeIndex] = accumulationStartHostTime
+                writeIndex = (writeIndex + 1) % Self.queueCapacity
+                queuedCount += 1
+                accumulatedCount = 0
+                accumulationStartHostTime = 0
+            }
+        }
+    }
+
+    func takeAll() -> [AudioAnalysisSignalFrame] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard queuedCount > 0, let sampleRate else { return [] }
+        var frames: [AudioAnalysisSignalFrame] = []
+        frames.reserveCapacity(queuedCount)
+        while queuedCount > 0 {
+            var samples = [Float](repeating: 0, count: frameCapacity)
+            var referenceSamples: [Float]?
+            let sourceOffset = readIndex * SpectrogramAnalyzer.maximumFrameCount
+            samples.withUnsafeMutableBufferPointer { destination in
+                queuedFrames.withUnsafeBufferPointer { source in
+                    destination.baseAddress?.update(
+                        from: source.baseAddress!.advanced(by: sourceOffset),
+                        count: frameCapacity
+                    )
+                }
+            }
+            if capturesReference {
+                var reference = [Float](repeating: 0, count: frameCapacity)
+                reference.withUnsafeMutableBufferPointer { destination in
+                    queuedReferenceFrames.withUnsafeBufferPointer { source in
+                        destination.baseAddress?.update(
+                            from: source.baseAddress!.advanced(by: sourceOffset),
+                            count: frameCapacity
+                        )
+                    }
+                }
+                referenceSamples = reference
+            }
+            let capturedAtUptime = Double(
+                AudioConvertHostTimeToNanos(queuedStartHostTimes[readIndex])
+            ) / 1_000_000_000
+            frames.append(AudioAnalysisSignalFrame(
+                samples: samples,
+                referenceSamples: referenceSamples,
+                sampleRate: sampleRate,
+                capturedAtUptime: capturedAtUptime
+            ))
+            readIndex = (readIndex + 1) % Self.queueCapacity
+            queuedCount -= 1
+        }
+        return frames
+    }
+
+    func discardPartialFrame() {
+        guard lock.try() else {
+            pendingAppendDrop = true
+            return
+        }
+        accumulatedCount = 0
+        accumulationStartHostTime = 0
+        lock.unlock()
+    }
+
+    func clear() {
+        lock.lock()
+        resetBuffers()
+        frameCapacity = 0
+        sampleRate = nil
+        capturesReference = false
+        lock.unlock()
+    }
+
+    private func resetBuffers() {
+        accumulatedCount = 0
+        accumulationStartHostTime = 0
+        readIndex = 0
+        writeIndex = 0
+        queuedCount = 0
+    }
+}
+
+struct AudioAnalysisSignalFrame {
+    let samples: [Float]
+    let referenceSamples: [Float]?
+    let sampleRate: Double
+    let capturedAtUptime: TimeInterval
+}
+
+private struct PairAudioBufferList {
+    var numberBuffers: UInt32
+    var firstBuffer: AudioBuffer
+    var secondBuffer: AudioBuffer
+}
+
 struct CompletedAudioSecond: Equatable {
     let intervalEndUTC: Date
     let snapshot: RawMeterSnapshot
@@ -267,8 +487,10 @@ final class AudioCaptureEngine {
     let latest = LatestSnapshotBox()
     private let completedSeconds = CompletedSecondQueue()
     private let health = AudioCaptureHealthBox()
+    private let spectrogramSignalTap = SpectrogramSignalTap()
     private var audioUnit: AudioUnit?
     private var processor: SPLProcessor?
+    private var capturesReference = false
     private var streamClockAnchorUTC: Date?
     private var streamClockAnchorHostTime: UInt64 = 0
     private var firstFrameUTC: Date?
@@ -280,12 +502,18 @@ final class AudioCaptureEngine {
 
     deinit { stop() }
 
-    func start(selection: InputSelection) throws {
+    func start(selection: InputSelection, referenceChannel: Int? = nil) throws {
         stop()
         guard let device = AudioDeviceRepository.device(uid: selection.deviceUID) else {
             throw AudioCaptureError.deviceMissing
         }
         guard selection.channel >= 0, selection.channel < device.inputChannelCount else {
+            throw AudioCaptureError.invalidChannel
+        }
+        if let referenceChannel,
+           (referenceChannel < 0
+               || referenceChannel >= device.inputChannelCount
+               || referenceChannel == selection.channel) {
             throw AudioCaptureError.invalidChannel
         }
 
@@ -326,6 +554,7 @@ final class AudioCaptureEngine {
             guard SPLProcessor.isValidSampleRate(sampleRate) else {
                 throw AudioCaptureError.unsupportedSampleRate(sampleRate)
             }
+            let outputChannelCount: UInt32 = referenceChannel == nil ? 1 : 2
             var format = AudioStreamBasicDescription(
                 mSampleRate: sampleRate,
                 mFormatID: kAudioFormatLinearPCM,
@@ -333,7 +562,7 @@ final class AudioCaptureEngine {
                 mBytesPerPacket: 4,
                 mFramesPerPacket: 1,
                 mBytesPerFrame: 4,
-                mChannelsPerFrame: 1,
+                mChannelsPerFrame: outputChannelCount,
                 mBitsPerChannel: 32,
                 mReserved: 0
             )
@@ -342,11 +571,15 @@ final class AudioCaptureEngine {
                 &format, UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
             ), L10n.text("formát vstupu"))
 
-            var channelMap = Int32(selection.channel)
-            try check(AudioUnitSetProperty(
-                unit, kAudioOutputUnitProperty_ChannelMap, kAudioUnitScope_Output, 1,
-                &channelMap, UInt32(MemoryLayout<Int32>.size)
-            ), L10n.text("volba kanálu"))
+            var channelMap = referenceChannel.map {
+                [Int32(selection.channel), Int32($0)]
+            } ?? [Int32(selection.channel)]
+            try channelMap.withUnsafeMutableBufferPointer { map in
+                try check(AudioUnitSetProperty(
+                    unit, kAudioOutputUnitProperty_ChannelMap, kAudioUnitScope_Output, 1,
+                    map.baseAddress, UInt32(map.count * MemoryLayout<Int32>.size)
+                ), L10n.text("volba kanálu"))
+            }
 
             var shouldAllocate: UInt32 = 1
             try check(AudioUnitSetProperty(
@@ -355,6 +588,11 @@ final class AudioCaptureEngine {
             ), L10n.text("alokace audio bufferu"))
 
             processor = SPLProcessor(sampleRate: sampleRate)
+            capturesReference = referenceChannel != nil
+            spectrogramSignalTap.configure(
+                sampleRate: sampleRate,
+                capturesReference: capturesReference
+            )
             var callback = AURenderCallbackStruct(
                 inputProc: Self.inputCallback,
                 inputProcRefCon: Unmanaged.passUnretained(self).toOpaque()
@@ -391,11 +629,21 @@ final class AudioCaptureEngine {
         }
         audioUnit = nil
         processor = nil
+        capturesReference = false
         streamClockAnchorUTC = nil
         firstFrameUTC = nil
         expectedNextSampleTime = nil
         pendingDiscontinuityMissingFrames = 0
         latest.clear()
+        spectrogramSignalTap.clear()
+    }
+
+    func setSpectrogramCaptureEnabled(_ enabled: Bool) {
+        spectrogramSignalTap.setEnabled(enabled)
+    }
+
+    func takeAnalysisSignalFrames() -> [AudioAnalysisSignalFrame] {
+        spectrogramSignalTap.takeAll()
     }
 
     func takeCompletedSecond() -> CompletedAudioSecond? {
@@ -436,12 +684,18 @@ final class AudioCaptureEngine {
         guard let unit = engine.audioUnit, let processor = engine.processor else {
             return kAudio_ParamError
         }
-        var bufferList = AudioBufferList(
-            mNumberBuffers: 1,
-            mBuffers: AudioBuffer(mNumberChannels: 1, mDataByteSize: 0, mData: nil)
+        var bufferList = PairAudioBufferList(
+            numberBuffers: engine.capturesReference ? 2 : 1,
+            firstBuffer: AudioBuffer(mNumberChannels: 1, mDataByteSize: 0, mData: nil),
+            secondBuffer: AudioBuffer(mNumberChannels: 1, mDataByteSize: 0, mData: nil)
         )
-        let status = AudioUnitRender(unit, flags, timestamp, 1, frameCount, &bufferList)
+        let status = withUnsafeMutablePointer(to: &bufferList) { pointer in
+            pointer.withMemoryRebound(to: AudioBufferList.self, capacity: 1) {
+                AudioUnitRender(unit, flags, timestamp, 1, frameCount, $0)
+            }
+        }
         guard status == noErr else {
+            engine.spectrogramSignalTap.discardPartialFrame()
             let discardedFrames = processor.invalidateTimeContinuity()
             engine.health.recordRenderError(
                 status,
@@ -450,7 +704,8 @@ final class AudioCaptureEngine {
             engine.prepareForNewTimeSegment(processor: processor)
             return status
         }
-        guard let data = bufferList.mBuffers.mData?.assumingMemoryBound(to: Float.self) else {
+        guard let data = bufferList.firstBuffer.mData?.assumingMemoryBound(to: Float.self) else {
+            engine.spectrogramSignalTap.discardPartialFrame()
             let discardedFrames = processor.invalidateTimeContinuity()
             engine.health.recordRenderError(
                 kAudio_ParamError,
@@ -460,6 +715,7 @@ final class AudioCaptureEngine {
             return kAudio_ParamError
         }
         if engine.updateStreamTiming(timestamp: timestamp.pointee, frameCount: frameCount) {
+            engine.spectrogramSignalTap.discardPartialFrame()
             let discardedFrames = processor.invalidateTimeContinuity()
             engine.health.recordDropout(
                 missingFrames: engine.pendingDiscontinuityMissingFrames,
@@ -467,6 +723,15 @@ final class AudioCaptureEngine {
             )
             engine.completedSecondTimestampBase = processor.currentCompletedSecondCount
         }
+        let bufferStartHostTime = timestamp.pointee.mFlags.contains(.hostTimeValid)
+            ? timestamp.pointee.mHostTime
+            : nil
+        engine.spectrogramSignalTap.append(
+            data,
+            referenceSamples: bufferList.secondBuffer.mData?.assumingMemoryBound(to: Float.self),
+            count: Int(frameCount),
+            bufferStartHostTime: bufferStartHostTime
+        )
         if let snapshot = processor.process(data, count: Int(frameCount)) {
             engine.latest.offer(snapshot)
             engine.health.update(snapshot, dspDroppedSecondCount: processor.lostSecondIntervals)

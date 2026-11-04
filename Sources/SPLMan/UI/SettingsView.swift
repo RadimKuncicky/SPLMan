@@ -84,6 +84,124 @@ struct SettingsView: View {
                         .padding(6)
                     }
 
+                    GroupBox(L10n.text("Analýza")) {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Picker(
+                                L10n.text("Zobrazení analýzy"),
+                                selection: analysisDisplayModeBinding
+                            ) {
+                                ForEach(AnalysisDisplayMode.allCases) { mode in
+                                    Text(mode.title).tag(mode)
+                                }
+                            }
+
+                            Picker(
+                                L10n.text("Referenční kanál"),
+                                selection: referenceChannelBinding
+                            ) {
+                                Text(L10n.text("Žádný")).tag(Int?.none)
+                                if let device = model.selectedDevice,
+                                   let measurementChannel = model.settings.input?.channel {
+                                    ForEach(
+                                        (0..<device.inputChannelCount).filter {
+                                            $0 != measurementChannel
+                                        },
+                                        id: \.self
+                                    ) { channel in
+                                        Text(L10n.format("Kanál %d", Int32(channel + 1)))
+                                            .tag(Optional(channel))
+                                    }
+                                }
+                            }
+                            .disabled(
+                                (model.selectedDevice?.inputChannelCount ?? 0) < 2
+                                    || !model.canReconfigureAnalysisInput
+                            )
+
+                            if model.settings.spectrogram.displayMode.showsTransferFunction {
+                                numericField(
+                                    title: L10n.text("Svislý rozsah TF"),
+                                    prefix: "±",
+                                    value: transferFunctionRangeBinding,
+                                    unit: "dB",
+                                    validation: SpectrogramSettings
+                                        .validatedTransferFunctionRange
+                                )
+
+                                Text(L10n.text("Křivka používá průběžné zarovnání impulsní odezvy a frekvenčně závislé časové okno."))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            VStack(alignment: .leading, spacing: 10) {
+                                Picker(
+                                    L10n.text("Frekvenční rozsah"),
+                                    selection: $model.settings.spectrogram.frequencyRange
+                                ) {
+                                    ForEach(SpectrogramFrequencyRange.allCases) { range in
+                                        Text(range.title).tag(range)
+                                    }
+                                }
+
+                                Picker(
+                                    L10n.text("Historie"),
+                                    selection: $model.settings.spectrogram.historyDuration
+                                ) {
+                                    ForEach(SpectrogramHistoryDuration.allCases) { duration in
+                                        Text(duration.title).tag(duration)
+                                    }
+                                }
+
+                                Picker(
+                                    L10n.text("Intenzita"),
+                                    selection: $model.settings.spectrogram.intensity
+                                ) {
+                                    ForEach(SpectrogramIntensity.allCases) { intensity in
+                                        Text(intensity.title).tag(intensity)
+                                    }
+                                }
+
+                                Picker(
+                                    L10n.text("Barevná stupnice"),
+                                    selection: $model.settings.spectrogram.palette
+                                ) {
+                                    ForEach(SpectrogramPalette.allCases) { palette in
+                                        Text(palette.title).tag(palette)
+                                    }
+                                }
+
+                                spectrogramLevelField(
+                                    title: L10n.text("Horní hranice"),
+                                    value: spectrogramUpperLevelBinding,
+                                    unit: "dB SPL",
+                                    validation: SpectrogramSettings.validatedUpperLevel
+                                )
+                                spectrogramLevelField(
+                                    title: L10n.text("Dynamický rozsah"),
+                                    value: spectrogramDynamicRangeBinding,
+                                    unit: "dB",
+                                    validation: SpectrogramSettings.validatedDynamicRange
+                                )
+
+                                Text(L10n.text("Po kalibraci barvy zobrazují přibližnou nekorigovanou hladinu (Z); bez kalibrace používají relativní stupnici dBFS."))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(L10n.text("Nízké frekvence používají jednotlivé FFT biny normalizované na šířku 1/24 oktávy; vyšší frekvence používají integrovaná 1/24oktávová pásma."))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                if model.selectedCalibration == nil {
+                                    Text(L10n.text("Bez kalibrace končí stupnice na 0 dBFS; nastavená horní hranice SPL se použije po kalibraci."))
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Text(L10n.text("Skutečný horní limit závisí na vzorkovací frekvenci vstupu."))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(6)
+                    }
+
                     GroupBox(L10n.text("Pořadí zobrazených měření")) {
                         List {
                             ForEach(model.settings.displayedMetrics) { metric in
@@ -256,22 +374,91 @@ struct SettingsView: View {
     ) -> some View {
         HStack {
             Text(title).frame(width: 210, alignment: .leading)
-            TextField("", value: start, format: .number.precision(.fractionLength(0)))
+            NumericTextField(value: start)
                 .frame(width: 55)
             Text("dB →")
-            TextField("", value: yellow, format: .number.precision(.fractionLength(0)))
+            NumericTextField(value: yellow)
                 .frame(width: 55)
             Text("dB")
         }
     }
 
-    private func thresholdField(title: String, value: Binding<Double>) -> some View {
+    private var spectrogramUpperLevelBinding: Binding<Double> {
+        Binding(
+            get: { model.settings.spectrogram.upperLevelDB },
+            set: {
+                model.settings.spectrogram.upperLevelDB = SpectrogramSettings
+                    .validatedUpperLevel($0)
+            }
+        )
+    }
+
+    private var analysisDisplayModeBinding: Binding<AnalysisDisplayMode> {
+        Binding(
+            get: { model.settings.spectrogram.displayMode },
+            set: model.setAnalysisDisplayMode
+        )
+    }
+
+    private var referenceChannelBinding: Binding<Int?> {
+        Binding(
+            get: { model.settings.spectrogram.referenceChannel },
+            set: model.selectReferenceChannel
+        )
+    }
+
+    private var spectrogramDynamicRangeBinding: Binding<Double> {
+        Binding(
+            get: { model.settings.spectrogram.dynamicRangeDB },
+            set: {
+                model.settings.spectrogram.dynamicRangeDB = SpectrogramSettings
+                    .validatedDynamicRange($0)
+            }
+        )
+    }
+
+    private var transferFunctionRangeBinding: Binding<Double> {
+        Binding(
+            get: { model.settings.spectrogram.transferFunctionRangeDB },
+            set: {
+                model.settings.spectrogram.transferFunctionRangeDB = SpectrogramSettings
+                    .validatedTransferFunctionRange($0)
+            }
+        )
+    }
+
+    private func spectrogramLevelField(
+        title: String,
+        value: Binding<Double>,
+        unit: String,
+        validation: @escaping (Double) -> Double
+    ) -> some View {
+        numericField(
+            title: title,
+            value: value,
+            unit: unit,
+            validation: validation
+        )
+    }
+
+    private func numericField(
+        title: String,
+        prefix: String? = nil,
+        value: Binding<Double>,
+        unit: String,
+        validation: @escaping (Double) -> Double = { $0 }
+    ) -> some View {
         HStack {
             Text(title).frame(width: 210, alignment: .leading)
-            TextField("", value: value, format: .number.precision(.fractionLength(0)))
+            if let prefix { Text(prefix) }
+            NumericTextField(value: value, validation: validation)
                 .frame(width: 55)
-            Text("dB")
+            Text(unit)
         }
+    }
+
+    private func thresholdField(title: String, value: Binding<Double>) -> some View {
+        numericField(title: title, value: value, unit: "dB")
     }
 
     private func historyDetail(_ entry: RecordingHistoryEntry) -> String {
@@ -321,6 +508,56 @@ struct SettingsView: View {
             .padding(8)
             .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
         }
+    }
+}
+
+private struct NumericTextField: View {
+    @Binding var value: Double
+    let validation: (Double) -> Double
+
+    @State private var draft = ""
+    @FocusState private var isFocused: Bool
+
+    init(
+        value: Binding<Double>,
+        validation: @escaping (Double) -> Double = { $0 }
+    ) {
+        _value = value
+        self.validation = validation
+    }
+
+    var body: some View {
+        TextField("", text: $draft)
+            .focused($isFocused)
+            .onAppear { draft = formatted(value) }
+            .onSubmit(commit)
+            .onChange(of: isFocused) { focused in
+                if !focused { commit() }
+            }
+            .onChange(of: value) { newValue in
+                if !isFocused { draft = formatted(newValue) }
+            }
+            .onDisappear(perform: commit)
+    }
+
+    private func commit() {
+        if let parsedValue = parsed(draft), parsedValue.isFinite {
+            value = validation(parsedValue.rounded())
+        }
+        draft = formatted(value)
+    }
+
+    private func parsed(_ text: String) -> Double? {
+        let formatter = NumberFormatter()
+        formatter.locale = .current
+        formatter.numberStyle = .decimal
+        formatter.isLenient = false
+        return formatter.number(from: text)?.doubleValue
+            ?? Double(text.replacingOccurrences(of: ",", with: "."))
+    }
+
+    private func formatted(_ value: Double) -> String {
+        value.formatted(.number.precision(.fractionLength(0)))
     }
 }
 
