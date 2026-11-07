@@ -1,307 +1,719 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
+/// Settings are laid out for the wide, low 1920 × 480 meter display:
+/// a sidebar with sections on the left and two-column content on the right,
+/// so each section fits the available height without long vertical scrolling.
+enum SettingsSection: String, CaseIterable, Identifiable {
+    case input
+    case display
+    case analysis
+    case alerts
+    case recording
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .input: L10n.text("Vstup a kalibrace")
+        case .display: L10n.text("Zobrazená měření")
+        case .analysis: L10n.text("Analýza")
+        case .alerts: L10n.text("Upozornění a alarmy")
+        case .recording: L10n.text("Záznam a historie")
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .input: "mic"
+        case .display: "rectangle.split.3x1"
+        case .analysis: "waveform"
+        case .alerts: "bell"
+        case .recording: "record.circle"
+        }
+    }
+}
+
 struct SettingsView: View {
     @ObservedObject var model: MeterModel
     @Environment(\.dismiss) private var dismiss
+    @AppStorage("SettingsView.selectedSection") private var selection: SettingsSection = .input
     @State private var draggedMetric: Metric?
+    @State private var isAnalysisNotesPresented = false
+
+    private static let instantMetrics: [Metric] = [.aSlow, .cSlow, .lafMax, .lcPeak]
+    private static let oneSecondMetrics: [Metric] = [
+        .laeq1Second, .lceq1Second, .lzeq1Second,
+        .lafMax1Second, .lasMax1Second, .lcPeak1Second
+    ]
+    private static let longTermMetrics: [Metric] = [
+        .laeq1, .laeq10, .laeq15, .laeq30, .lceq1, .lceq10, .lceq30
+    ]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            HStack {
-                Text(L10n.text("Nastavení SPL"))
-                    .font(.title.bold())
-                Spacer()
-                Button(L10n.text("Hotovo")) { dismiss() }
-                    .keyboardShortcut(.defaultAction)
+        HStack(spacing: 0) {
+            sidebar
+                .frame(width: 220)
+            Divider()
+            VStack(alignment: .leading, spacing: 0) {
+                HStack {
+                    Text(selection.title)
+                        .font(.title2.bold())
+                    Spacer()
+                    Button(L10n.text("Hotovo")) { dismiss() }
+                        .keyboardShortcut(.defaultAction)
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 14)
+                Divider()
+                sectionContent
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
+        }
+        .frame(width: 1240, height: 440)
+    }
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    GroupBox(L10n.text("Zvukový vstup")) {
-                        VStack(alignment: .leading, spacing: 12) {
-                            HStack {
-                                Picker(L10n.text("Zařízení"), selection: deviceBinding) {
-                                    Text(L10n.text("Nevybráno")).tag("")
-                                    ForEach(model.devices) { device in
-                                        Text(device.name).tag(device.uid)
-                                    }
+    // MARK: - Sidebar
+
+    private var sidebar: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(L10n.text("Nastavení SPL"))
+                .font(.headline)
+                .padding(.horizontal, 10)
+                .padding(.top, 18)
+                .padding(.bottom, 10)
+
+            ForEach(SettingsSection.allCases) { section in
+                sidebarRow(section)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 10)
+        .background(Color.secondary.opacity(0.06))
+    }
+
+    private func sidebarRow(_ section: SettingsSection) -> some View {
+        Button {
+            selection = section
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: section.systemImage)
+                    .frame(width: 20)
+                Text(section.title)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                if let badge = badgeColor(for: section) {
+                    Circle()
+                        .fill(badge)
+                        .frame(width: 8, height: 8)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 7)
+                    .fill(selection == section ? Color.accentColor.opacity(0.25) : Color.clear)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selection == section ? .isSelected : [])
+    }
+
+    private func badgeColor(for section: SettingsSection) -> Color? {
+        switch section {
+        case .input:
+            return !model.isRunning || model.selectedCalibration == nil ? .orange : nil
+        case .recording:
+            return model.isRecording ? .red : nil
+        case .display, .analysis, .alerts:
+            return nil
+        }
+    }
+
+    @ViewBuilder
+    private var sectionContent: some View {
+        switch selection {
+        case .input: scrolling { inputSection }
+        case .display: scrolling { displaySection }
+        case .analysis: scrolling { analysisSection }
+        case .alerts: scrolling { alertsSection }
+        case .recording: recordingSection
+        }
+    }
+
+    private func scrolling<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        let content = content()
+        return ScrollView {
+            content
+                .padding(20)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+    }
+
+    // MARK: - Input and calibration
+
+    private var inputSection: some View {
+        HStack(alignment: .top, spacing: 16) {
+            settingsGroup(L10n.text("Zvukový vstup")) {
+                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+                    settingRow(L10n.text("Zařízení")) {
+                        HStack {
+                            Picker(L10n.text("Zařízení"), selection: deviceBinding) {
+                                Text(L10n.text("Nevybráno")).tag("")
+                                ForEach(model.devices) { device in
+                                    Text(device.name).tag(device.uid)
                                 }
-                                Button(L10n.text("Obnovit")) { model.refreshDevices() }
                             }
-
-                            if let device = model.selectedDevice {
-                                Picker(L10n.text("Kanál"), selection: channelBinding) {
-                                    ForEach(0..<device.inputChannelCount, id: \.self) { channel in
-                                        Text(L10n.format("Kanál %d", Int32(channel + 1))).tag(channel)
-                                    }
-                                }
-                            }
-
-                            Text(model.status)
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-
-                            HStack {
-                                Button(L10n.text("Spustit vstup")) { model.startSelectedInput() }
-                                    .disabled(model.settings.input == nil || model.isRunning)
-                                Button(L10n.text("Kalibrovat na 94 dB")) { model.beginCalibration() }
-                                    .disabled(!model.isRunning)
-                                if let progress = model.calibrationProgress {
-                                    ProgressView(value: progress)
-                                        .frame(width: 170)
-                                } else if let calibration = model.selectedCalibration {
-                                    Text(L10n.format("Kalibrováno %@", calibration.calibratedAt.formatted(date: .abbreviated, time: .shortened)))
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
+                            .labelsHidden()
+                            .frame(maxWidth: 300)
+                            Button(L10n.text("Obnovit")) { model.refreshDevices() }
                         }
-                        .padding(6)
                     }
-
-                    GroupBox(L10n.text("Měřicí relace")) {
-                        VStack(alignment: .leading, spacing: 8) {
-                            TextField(L10n.text("Název akce"), text: $model.recordingMetadata.eventName)
-                            TextField(L10n.text("Místo měření"), text: $model.recordingMetadata.location)
-                            TextField(L10n.text("Identifikace mikrofonu"), text: $model.recordingMetadata.microphoneID)
-                            TextField(L10n.text("Poznámka"), text: $model.recordingMetadata.note, axis: .vertical)
-                                .lineLimit(2...4)
-                            Text(L10n.text("Metadata se uloží do následující měřicí relace."))
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        .padding(6)
-                        .disabled(model.isRecording || model.isPreparingRecording)
-                    }
-
-                    GroupBox(L10n.text("Zobrazená měření")) {
-                        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], alignment: .leading) {
-                            ForEach(Metric.allCases) { metric in
-                                Toggle(metric.title, isOn: metricBinding(metric))
-                            }
-                        }
-                        .padding(6)
-                    }
-
-                    GroupBox(L10n.text("Analýza")) {
-                        VStack(alignment: .leading, spacing: 10) {
-                            Picker(
-                                L10n.text("Zobrazení analýzy"),
-                                selection: analysisDisplayModeBinding
-                            ) {
-                                ForEach(AnalysisDisplayMode.allCases) { mode in
-                                    Text(mode.title).tag(mode)
+                    if let device = model.selectedDevice {
+                        settingRow(L10n.text("Kanál")) {
+                            Picker(L10n.text("Kanál"), selection: channelBinding) {
+                                ForEach(0..<device.inputChannelCount, id: \.self) { channel in
+                                    Text(L10n.format("Kanál %d", Int32(channel + 1))).tag(channel)
                                 }
                             }
-
-                            Picker(
-                                L10n.text("Referenční kanál"),
-                                selection: referenceChannelBinding
-                            ) {
-                                Text(L10n.text("Žádný")).tag(Int?.none)
-                                if let device = model.selectedDevice,
-                                   let measurementChannel = model.settings.input?.channel {
-                                    ForEach(
-                                        (0..<device.inputChannelCount).filter {
-                                            $0 != measurementChannel
-                                        },
-                                        id: \.self
-                                    ) { channel in
-                                        Text(L10n.format("Kanál %d", Int32(channel + 1)))
-                                            .tag(Optional(channel))
-                                    }
-                                }
-                            }
-                            .disabled(
-                                (model.selectedDevice?.inputChannelCount ?? 0) < 2
-                                    || !model.canReconfigureAnalysisInput
-                            )
-
-                            if model.settings.spectrogram.displayMode.showsTransferFunction {
-                                numericField(
-                                    title: L10n.text("Svislý rozsah TF"),
-                                    prefix: "±",
-                                    value: transferFunctionRangeBinding,
-                                    unit: "dB",
-                                    validation: SpectrogramSettings
-                                        .validatedTransferFunctionRange
-                                )
-
-                                Text(L10n.text("Křivka používá průběžné zarovnání impulsní odezvy a frekvenčně závislé časové okno."))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-
-                            VStack(alignment: .leading, spacing: 10) {
-                                Picker(
-                                    L10n.text("Frekvenční rozsah"),
-                                    selection: $model.settings.spectrogram.frequencyRange
-                                ) {
-                                    ForEach(SpectrogramFrequencyRange.allCases) { range in
-                                        Text(range.title).tag(range)
-                                    }
-                                }
-
-                                Picker(
-                                    L10n.text("Historie"),
-                                    selection: $model.settings.spectrogram.historyDuration
-                                ) {
-                                    ForEach(SpectrogramHistoryDuration.allCases) { duration in
-                                        Text(duration.title).tag(duration)
-                                    }
-                                }
-
-                                Picker(
-                                    L10n.text("Intenzita"),
-                                    selection: $model.settings.spectrogram.intensity
-                                ) {
-                                    ForEach(SpectrogramIntensity.allCases) { intensity in
-                                        Text(intensity.title).tag(intensity)
-                                    }
-                                }
-
-                                Picker(
-                                    L10n.text("Barevná stupnice"),
-                                    selection: $model.settings.spectrogram.palette
-                                ) {
-                                    ForEach(SpectrogramPalette.allCases) { palette in
-                                        Text(palette.title).tag(palette)
-                                    }
-                                }
-
-                                spectrogramLevelField(
-                                    title: L10n.text("Horní hranice"),
-                                    value: spectrogramUpperLevelBinding,
-                                    unit: "dB SPL",
-                                    validation: SpectrogramSettings.validatedUpperLevel
-                                )
-                                spectrogramLevelField(
-                                    title: L10n.text("Dynamický rozsah"),
-                                    value: spectrogramDynamicRangeBinding,
-                                    unit: "dB",
-                                    validation: SpectrogramSettings.validatedDynamicRange
-                                )
-
-                                Text(L10n.text("Po kalibraci barvy zobrazují přibližnou nekorigovanou hladinu (Z); bez kalibrace používají relativní stupnici dBFS."))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                Text(L10n.text("Nízké frekvence používají jednotlivé FFT biny normalizované na šířku 1/24 oktávy; vyšší frekvence používají integrovaná 1/24oktávová pásma."))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                if model.selectedCalibration == nil {
-                                    Text(L10n.text("Bez kalibrace končí stupnice na 0 dBFS; nastavená horní hranice SPL se použije po kalibraci."))
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                Text(L10n.text("Skutečný horní limit závisí na vzorkovací frekvenci vstupu."))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                        .padding(6)
-                    }
-
-                    GroupBox(L10n.text("Pořadí zobrazených měření")) {
-                        List {
-                            ForEach(model.settings.displayedMetrics) { metric in
-                                metricOrderRow(metric)
-                                    .onDrop(
-                                        of: [UTType.plainText.identifier],
-                                        delegate: MetricDropDelegate(
-                                            targetMetric: metric,
-                                            draggedMetric: $draggedMetric,
-                                            move: model.moveMetric
-                                        )
-                                    )
-                            }
-                        }
-                        .listStyle(.bordered)
-                        .frame(height: metricOrderListHeight)
-                        .padding(6)
-                    }
-
-                    GroupBox(L10n.text("Barevné upozornění")) {
-                        VStack(alignment: .leading, spacing: 8) {
-                            thresholdRow(
-                                title: L10n.text("A: přechod / žlutá"),
-                                start: $model.settings.thresholds.aTransitionStart,
-                                yellow: $model.settings.thresholds.aYellow
-                            )
-                            thresholdRow(
-                                title: L10n.text("C: přechod / žlutá"),
-                                start: $model.settings.thresholds.cTransitionStart,
-                                yellow: $model.settings.thresholds.cYellow
-                            )
-                            Text(L10n.text("Barvy jsou pouze orientační vizuální upozornění pro live sound."))
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        .padding(6)
-                    }
-
-                    GroupBox(L10n.text("Alarmy měření")) {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Toggle(L10n.text("Zaznamenávat překročení limitů"), isOn: $model.alarmSettings.isEnabled)
-                            thresholdField(
-                                title: "LAeq 30 min",
-                                value: $model.alarmSettings.laeq30MinuteLimit
-                            )
-                            thresholdField(
-                                title: "LCpeak",
-                                value: $model.alarmSettings.lcPeakLimit
-                            )
-                            Text(L10n.text("Výchozí hodnoty jsou orientační. Neprokazují shodu měření s DIN 15905-5."))
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        .padding(6)
-                    }
-
-                    GroupBox(L10n.text("Historie záznamů")) {
-                        if model.recordingHistory.isEmpty {
-                            Text(L10n.text("Zatím nebyl vytvořen žádný záznam."))
-                                .foregroundStyle(.secondary)
-                                .padding(6)
-                        } else {
-                            VStack(spacing: 0) {
-                                ForEach(model.recordingHistory) { entry in
-                                    VStack(alignment: .leading, spacing: 8) {
-                                        HStack(spacing: 10) {
-                                            VStack(alignment: .leading, spacing: 2) {
-                                                Text(entry.eventName.isEmpty ? L10n.text("Měření") : entry.eventName)
-                                                    .lineLimit(1)
-                                                Text(historyDetail(entry))
-                                                    .font(.caption)
-                                                    .foregroundStyle(.secondary)
-                                                    .lineLimit(1)
-                                            }
-                                            Spacer()
-                                            Text(entry.state.title)
-                                                .font(.caption)
-                                                .foregroundStyle(entry.state == .failed ? .red : .secondary)
-                                            Button(model.selectedEventSessionID == entry.id ? L10n.text("Skrýt události") : L10n.text("Události")) {
-                                                model.toggleRecordingEvents(entry)
-                                            }
-                                            Button(L10n.text("Zobrazit")) { model.revealRecording(entry) }
-                                        }
-                                        if model.selectedEventSessionID == entry.id {
-                                            recordingEvents
-                                        }
-                                    }
-                                    .padding(.vertical, 6)
-                                    if entry.id != model.recordingHistory.last?.id { Divider() }
-                                }
-                            }
-                            .padding(6)
+                            .labelsHidden()
+                            .fixedSize()
                         }
                     }
                 }
+
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Circle()
+                        .fill(model.isRunning ? Color.green : Color.secondary)
+                        .frame(width: 8, height: 8)
+                    Text(model.status)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Button(L10n.text("Spustit vstup")) { model.startSelectedInput() }
+                    .disabled(model.settings.input == nil || model.isRunning)
+            }
+
+            settingsGroup(L10n.text("Kalibrace")) {
+                if let calibration = model.selectedCalibration {
+                    Label {
+                        Text(L10n.format(
+                            "Kalibrováno %@",
+                            calibration.calibratedAt.formatted(date: .abbreviated, time: .shortened)
+                        ))
+                    } icon: {
+                        Image(systemName: "checkmark.seal.fill")
+                            .foregroundStyle(.green)
+                    }
+                } else {
+                    Label {
+                        Text(L10n.text("Nekalibrováno"))
+                    } icon: {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                    }
+                }
+
+                HStack(spacing: 12) {
+                    Button(L10n.text("Kalibrovat na 94 dB")) { model.beginCalibration() }
+                        .disabled(!model.isRunning)
+                    if let progress = model.calibrationProgress {
+                        ProgressView(value: progress)
+                            .frame(width: 200)
+                    }
+                }
+
+                caption(L10n.text("Spusťte vstup, přiložte kalibrátor 1 kHz / 94 dB a zvolte Kalibrovat. Kalibrace trvá nejméně 9 s."))
             }
         }
-        .padding(24)
-        .frame(width: 760, height: 480)
     }
+
+    // MARK: - Displayed measurements
+
+    private var displaySection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            settingsGroup(L10n.text("Pořadí zobrazených měření")) {
+                ScrollView(.horizontal) {
+                    HStack(spacing: 6) {
+                        ForEach(model.settings.displayedMetrics) { metric in
+                            metricOrderChip(metric)
+                                .onDrop(
+                                    of: [UTType.plainText.identifier],
+                                    delegate: MetricDropDelegate(
+                                        targetMetric: metric,
+                                        draggedMetric: $draggedMetric,
+                                        move: model.moveMetric
+                                    )
+                                )
+                        }
+                        clockChip
+                    }
+                    .padding(.vertical, 4)
+                }
+
+                HStack {
+                    caption(L10n.text("Sloupce na displeji zleva doprava. Přetažením nebo šipkami změňte pořadí."))
+                    Spacer()
+                    caption(L10n.format(
+                        "Sloupce na displeji: %d + hodiny",
+                        Int32(model.settings.displayedMetrics.count)
+                    ))
+                }
+            }
+
+            settingsGroup(L10n.text("Zobrazená měření")) {
+                HStack(alignment: .top, spacing: 24) {
+                    metricToggleColumn(L10n.text("Okamžité hodnoty"), metrics: Self.instantMetrics)
+                    metricToggleColumn(L10n.text("Hodnoty za 1 s"), metrics: Self.oneSecondMetrics)
+                    metricToggleColumn(L10n.text("Dlouhodobé Leq"), metrics: longTermAndOtherMetrics)
+                }
+            }
+        }
+    }
+
+    /// Long-term metrics plus any metric not assigned to a group, so a newly
+    /// added metric is never missing from the settings.
+    private var longTermAndOtherMetrics: [Metric] {
+        let grouped = Set(Self.instantMetrics + Self.oneSecondMetrics + Self.longTermMetrics)
+        return Self.longTermMetrics + Metric.allCases.filter { !grouped.contains($0) }
+    }
+
+    private func metricToggleColumn(_ title: String, metrics: [Metric]) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+            ForEach(metrics) { metric in
+                Toggle(metric.title, isOn: metricBinding(metric))
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func metricOrderChip(_ metric: Metric) -> some View {
+        let index = model.settings.displayedMetrics.firstIndex(of: metric) ?? 0
+        let lastIndex = model.settings.displayedMetrics.count - 1
+
+        return VStack(spacing: 6) {
+            Text(metric.title)
+                .font(.callout.weight(.semibold))
+                .lineLimit(1)
+            HStack(spacing: 6) {
+                Button {
+                    model.moveMetric(metric, by: -1)
+                } label: {
+                    Image(systemName: "chevron.left")
+                }
+                .buttonStyle(.borderless)
+                .disabled(index == 0)
+                .help(L10n.text("Posunout vlevo"))
+                .accessibilityLabel(L10n.format("Posunout %@ vlevo", metric.title))
+
+                Image(systemName: "line.3.horizontal")
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+
+                Button {
+                    model.moveMetric(metric, by: 1)
+                } label: {
+                    Image(systemName: "chevron.right")
+                }
+                .buttonStyle(.borderless)
+                .disabled(index == lastIndex)
+                .help(L10n.text("Posunout vpravo"))
+                .accessibilityLabel(L10n.format("Posunout %@ vpravo", metric.title))
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(minWidth: 108)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.secondary.opacity(0.12))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color.secondary.opacity(0.3))
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 8))
+        .help(L10n.text("Přetažením změňte pořadí"))
+        .onDrag {
+            draggedMetric = metric
+            return NSItemProvider(object: metric.rawValue as NSString)
+        }
+    }
+
+    private var clockChip: some View {
+        VStack(spacing: 6) {
+            Image(systemName: "clock")
+            Text(L10n.text("Hodiny"))
+                .font(.callout)
+        }
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(minWidth: 84)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color.secondary.opacity(0.3), style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+        )
+    }
+
+    // MARK: - Analysis
+
+    private var analysisSection: some View {
+        HStack(alignment: .top, spacing: 16) {
+            settingsGroup(L10n.text("Zobrazení analýzy")) {
+                Picker(L10n.text("Zobrazení analýzy"), selection: analysisDisplayModeBinding) {
+                    ForEach(AnalysisDisplayMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.radioGroup)
+                .labelsHidden()
+
+                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+                    settingRow(L10n.text("Referenční kanál")) {
+                        Picker(L10n.text("Referenční kanál"), selection: referenceChannelBinding) {
+                            Text(L10n.text("Žádný")).tag(Int?.none)
+                            if let device = model.selectedDevice,
+                               let measurementChannel = model.settings.input?.channel {
+                                ForEach(
+                                    (0..<device.inputChannelCount).filter {
+                                        $0 != measurementChannel
+                                    },
+                                    id: \.self
+                                ) { channel in
+                                    Text(L10n.format("Kanál %d", Int32(channel + 1)))
+                                        .tag(Optional(channel))
+                                }
+                            }
+                        }
+                        .labelsHidden()
+                        .fixedSize()
+                        .disabled(
+                            (model.selectedDevice?.inputChannelCount ?? 0) < 2
+                                || !model.canReconfigureAnalysisInput
+                        )
+                    }
+
+                    settingRow(L10n.text("Frekvenční rozsah")) {
+                        Picker(
+                            L10n.text("Frekvenční rozsah"),
+                            selection: $model.settings.spectrogram.frequencyRange
+                        ) {
+                            ForEach(SpectrogramFrequencyRange.allCases) { range in
+                                Text(range.title).tag(range)
+                            }
+                        }
+                        .labelsHidden()
+                        .fixedSize()
+                    }
+
+                    if model.settings.spectrogram.displayMode.showsTransferFunction {
+                        settingRow(L10n.text("Svislý rozsah TF")) {
+                            numericInput(
+                                prefix: "±",
+                                value: transferFunctionRangeBinding,
+                                unit: "dB",
+                                validation: SpectrogramSettings.validatedTransferFunctionRange
+                            )
+                        }
+                    }
+                }
+
+                if model.settings.spectrogram.displayMode.showsTransferFunction {
+                    caption(L10n.text("Křivka používá průběžné zarovnání impulsní odezvy a frekvenčně závislé časové okno."))
+                }
+            }
+
+            settingsGroup(L10n.text("Spektrogram")) {
+                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+                    settingRow(L10n.text("Historie")) {
+                        Picker(
+                            L10n.text("Historie"),
+                            selection: $model.settings.spectrogram.historyDuration
+                        ) {
+                            ForEach(SpectrogramHistoryDuration.allCases) { duration in
+                                Text(duration.title).tag(duration)
+                            }
+                        }
+                        .labelsHidden()
+                        .fixedSize()
+                    }
+
+                    settingRow(L10n.text("Intenzita")) {
+                        Picker(
+                            L10n.text("Intenzita"),
+                            selection: $model.settings.spectrogram.intensity
+                        ) {
+                            ForEach(SpectrogramIntensity.allCases) { intensity in
+                                Text(intensity.title).tag(intensity)
+                            }
+                        }
+                        .labelsHidden()
+                        .fixedSize()
+                    }
+
+                    settingRow(L10n.text("Barevná stupnice")) {
+                        Picker(
+                            L10n.text("Barevná stupnice"),
+                            selection: $model.settings.spectrogram.palette
+                        ) {
+                            ForEach(SpectrogramPalette.allCases) { palette in
+                                Text(palette.title).tag(palette)
+                            }
+                        }
+                        .labelsHidden()
+                        .fixedSize()
+                    }
+
+                    settingRow(L10n.text("Horní hranice")) {
+                        numericInput(
+                            value: spectrogramUpperLevelBinding,
+                            unit: "dB SPL",
+                            validation: SpectrogramSettings.validatedUpperLevel
+                        )
+                    }
+
+                    settingRow(L10n.text("Dynamický rozsah")) {
+                        numericInput(
+                            value: spectrogramDynamicRangeBinding,
+                            unit: "dB",
+                            validation: SpectrogramSettings.validatedDynamicRange
+                        )
+                    }
+                }
+
+                if model.selectedCalibration == nil {
+                    caption(L10n.text("Bez kalibrace končí stupnice na 0 dBFS; nastavená horní hranice SPL se použije po kalibraci."))
+                }
+
+                Button {
+                    isAnalysisNotesPresented.toggle()
+                } label: {
+                    Label(L10n.text("Technické poznámky"), systemImage: "info.circle")
+                }
+                .buttonStyle(.borderless)
+                .popover(isPresented: $isAnalysisNotesPresented, arrowEdge: .bottom) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        noteText(L10n.text("Po kalibraci barvy zobrazují přibližnou nekorigovanou hladinu (Z); bez kalibrace používají relativní stupnici dBFS."))
+                        noteText(L10n.text("Nízké frekvence používají jednotlivé FFT biny normalizované na šířku 1/24 oktávy; vyšší frekvence používají integrovaná 1/24oktávová pásma."))
+                        noteText(L10n.text("Skutečný horní limit závisí na vzorkovací frekvenci vstupu."))
+                    }
+                    .padding(16)
+                    .frame(width: 380)
+                }
+            }
+        }
+    }
+
+    // MARK: - Alerts and alarms
+
+    private var alertsSection: some View {
+        HStack(alignment: .top, spacing: 16) {
+            settingsGroup(L10n.text("Barevné upozornění")) {
+                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+                    settingRow(L10n.text("A: přechod / žlutá")) {
+                        thresholdInputs(
+                            start: $model.settings.thresholds.aTransitionStart,
+                            yellow: $model.settings.thresholds.aYellow
+                        )
+                    }
+                    settingRow(L10n.text("C: přechod / žlutá")) {
+                        thresholdInputs(
+                            start: $model.settings.thresholds.cTransitionStart,
+                            yellow: $model.settings.thresholds.cYellow
+                        )
+                    }
+                }
+                caption(L10n.text("Barvy jsou pouze orientační vizuální upozornění pro live sound."))
+            }
+
+            settingsGroup(L10n.text("Alarmy měření")) {
+                Toggle(L10n.text("Zaznamenávat překročení limitů"), isOn: $model.alarmSettings.isEnabled)
+                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+                    settingRow("LAeq 30 min") {
+                        numericInput(value: $model.alarmSettings.laeq30MinuteLimit, unit: "dB")
+                    }
+                    settingRow("LCpeak") {
+                        numericInput(value: $model.alarmSettings.lcPeakLimit, unit: "dB")
+                    }
+                }
+                .disabled(!model.alarmSettings.isEnabled)
+                caption(L10n.text("Výchozí hodnoty jsou orientační. Neprokazují shodu měření s DIN 15905-5."))
+            }
+        }
+    }
+
+    private func thresholdInputs(start: Binding<Double>, yellow: Binding<Double>) -> some View {
+        HStack(spacing: 6) {
+            NumericTextField(value: start)
+                .frame(width: 60)
+            Text("dB →")
+                .foregroundStyle(.secondary)
+            NumericTextField(value: yellow)
+                .frame(width: 60)
+            Text("dB")
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - Recording and history
+
+    private var recordingSection: some View {
+        HStack(alignment: .top, spacing: 16) {
+            ScrollView {
+                settingsGroup(L10n.text("Měřicí relace")) {
+                    Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
+                        settingRow(L10n.text("Název akce")) {
+                            TextField(L10n.text("Název akce"), text: $model.recordingMetadata.eventName)
+                                .labelsHidden()
+                        }
+                        settingRow(L10n.text("Místo měření")) {
+                            TextField(L10n.text("Místo měření"), text: $model.recordingMetadata.location)
+                                .labelsHidden()
+                        }
+                        settingRow(L10n.text("Identifikace mikrofonu")) {
+                            TextField(L10n.text("Identifikace mikrofonu"), text: $model.recordingMetadata.microphoneID)
+                                .labelsHidden()
+                        }
+                        settingRow(L10n.text("Poznámka")) {
+                            TextField(L10n.text("Poznámka"), text: $model.recordingMetadata.note, axis: .vertical)
+                                .labelsHidden()
+                                .lineLimit(2...4)
+                        }
+                    }
+                    .disabled(model.isRecording || model.isPreparingRecording)
+
+                    caption(
+                        model.isRecording || model.isPreparingRecording
+                            ? L10n.text("Během záznamu nelze metadata měnit.")
+                            : L10n.text("Metadata se uloží do následující měřicí relace.")
+                    )
+                }
+                .padding(.vertical, 20)
+                .padding(.leading, 20)
+            }
+            .frame(width: 480)
+
+            settingsGroup(L10n.text("Historie záznamů")) {
+                if model.recordingHistory.isEmpty {
+                    Text(L10n.text("Zatím nebyl vytvořen žádný záznam."))
+                        .foregroundStyle(.secondary)
+                } else {
+                    ScrollView {
+                        LazyVStack(spacing: 0) {
+                            ForEach(model.recordingHistory) { entry in
+                                historyRow(entry)
+                                if entry.id != model.recordingHistory.last?.id { Divider() }
+                            }
+                        }
+                        .padding(.trailing, 8)
+                    }
+                    .frame(maxHeight: .infinity)
+                }
+            }
+            .padding(.vertical, 20)
+            .padding(.trailing, 20)
+            .frame(maxHeight: .infinity, alignment: .top)
+        }
+    }
+
+    private func historyRow(_ entry: RecordingHistoryEntry) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(entry.eventName.isEmpty ? L10n.text("Měření") : entry.eventName)
+                        .lineLimit(1)
+                    Text(historyDetail(entry))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                Text(entry.state.title)
+                    .font(.caption)
+                    .foregroundStyle(entry.state == .failed ? .red : .secondary)
+                Button(model.selectedEventSessionID == entry.id ? L10n.text("Skrýt události") : L10n.text("Události")) {
+                    model.toggleRecordingEvents(entry)
+                }
+                Button(L10n.text("Zobrazit")) { model.revealRecording(entry) }
+            }
+            if model.selectedEventSessionID == entry.id {
+                recordingEvents
+            }
+        }
+        .padding(.vertical, 6)
+    }
+
+    // MARK: - Building blocks
+
+    private func settingsGroup<Content: View>(
+        _ title: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        let content = content()
+        return GroupBox {
+            VStack(alignment: .leading, spacing: 12) {
+                content
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        } label: {
+            Text(title)
+                .font(.headline)
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+
+    private func settingRow<Content: View>(
+        _ title: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        let content = content()
+        return GridRow {
+            Text(title)
+                .foregroundStyle(.secondary)
+                .gridColumnAlignment(.trailing)
+            content
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func numericInput(
+        prefix: String? = nil,
+        value: Binding<Double>,
+        unit: String,
+        validation: @escaping (Double) -> Double = { $0 }
+    ) -> some View {
+        HStack(spacing: 6) {
+            if let prefix { Text(prefix) }
+            NumericTextField(value: value, validation: validation)
+                .frame(width: 60)
+            Text(unit)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func caption(_ text: String) -> some View {
+        Text(text)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func noteText(_ text: String) -> some View {
+        Text(text)
+            .font(.callout)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    // MARK: - Bindings
 
     private var deviceBinding: Binding<String> {
         Binding(
@@ -322,65 +734,6 @@ struct SettingsView: View {
             get: { model.settings.displayedMetrics.contains(metric) },
             set: { _ in model.toggleMetric(metric) }
         )
-    }
-
-    private var metricOrderListHeight: CGFloat {
-        CGFloat(model.settings.displayedMetrics.count * 34 + 4)
-    }
-
-    private func metricOrderRow(_ metric: Metric) -> some View {
-        let index = model.settings.displayedMetrics.firstIndex(of: metric) ?? 0
-        let lastIndex = model.settings.displayedMetrics.count - 1
-
-        return HStack(spacing: 10) {
-            Image(systemName: "line.3.horizontal")
-                .foregroundStyle(.secondary)
-                .help(L10n.text("Přetažením změňte pořadí"))
-                .onDrag {
-                    draggedMetric = metric
-                    return NSItemProvider(object: metric.rawValue as NSString)
-                }
-
-            Text(metric.title)
-            Spacer()
-
-            Button {
-                model.moveMetric(metric, by: -1)
-            } label: {
-                Image(systemName: "arrow.left")
-            }
-            .buttonStyle(.borderless)
-            .disabled(index == 0)
-            .help(L10n.text("Posunout vlevo"))
-            .accessibilityLabel(L10n.format("Posunout %@ vlevo", metric.title))
-
-            Button {
-                model.moveMetric(metric, by: 1)
-            } label: {
-                Image(systemName: "arrow.right")
-            }
-            .buttonStyle(.borderless)
-            .disabled(index == lastIndex)
-            .help(L10n.text("Posunout vpravo"))
-            .accessibilityLabel(L10n.format("Posunout %@ vpravo", metric.title))
-        }
-        .contentShape(Rectangle())
-    }
-
-    private func thresholdRow(
-        title: String,
-        start: Binding<Double>,
-        yellow: Binding<Double>
-    ) -> some View {
-        HStack {
-            Text(title).frame(width: 210, alignment: .leading)
-            NumericTextField(value: start)
-                .frame(width: 55)
-            Text("dB →")
-            NumericTextField(value: yellow)
-                .frame(width: 55)
-            Text("dB")
-        }
     }
 
     private var spectrogramUpperLevelBinding: Binding<Double> {
@@ -425,40 +778,6 @@ struct SettingsView: View {
                     .validatedTransferFunctionRange($0)
             }
         )
-    }
-
-    private func spectrogramLevelField(
-        title: String,
-        value: Binding<Double>,
-        unit: String,
-        validation: @escaping (Double) -> Double
-    ) -> some View {
-        numericField(
-            title: title,
-            value: value,
-            unit: unit,
-            validation: validation
-        )
-    }
-
-    private func numericField(
-        title: String,
-        prefix: String? = nil,
-        value: Binding<Double>,
-        unit: String,
-        validation: @escaping (Double) -> Double = { $0 }
-    ) -> some View {
-        HStack {
-            Text(title).frame(width: 210, alignment: .leading)
-            if let prefix { Text(prefix) }
-            NumericTextField(value: value, validation: validation)
-                .frame(width: 55)
-            Text(unit)
-        }
-    }
-
-    private func thresholdField(title: String, value: Binding<Double>) -> some View {
-        numericField(title: title, value: value, unit: "dB")
     }
 
     private func historyDetail(_ entry: RecordingHistoryEntry) -> String {
@@ -528,6 +847,7 @@ private struct NumericTextField: View {
 
     var body: some View {
         TextField("", text: $draft)
+            .multilineTextAlignment(.trailing)
             .focused($isFocused)
             .onAppear { draft = formatted(value) }
             .onSubmit(commit)

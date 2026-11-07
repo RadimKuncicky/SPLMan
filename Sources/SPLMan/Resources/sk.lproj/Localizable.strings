@@ -188,3 +188,17 @@
 "Referenční signál je příliš slabý nebo neplatný." = "Referenčný signál je príliš slabý alebo neplatný.";
 "Svislý rozsah TF" = "Zvislý rozsah TF";
 "Křivka používá průběžné zarovnání impulsní odezvy a frekvenčně závislé časové okno." = "Krivka používa priebežné zarovnanie impulznej odozvy a frekvenčne závislé časové okno.";
+"Vstup a kalibrace" = "Vstup a kalibrácia";
+"Upozornění a alarmy" = "Upozornenia a alarmy";
+"Záznam a historie" = "Záznam a história";
+"Kalibrace" = "Kalibrácia";
+"Nekalibrováno" = "Nekalibrované";
+"Spusťte vstup, přiložte kalibrátor 1 kHz / 94 dB a zvolte Kalibrovat. Kalibrace trvá nejméně 9 s." = "Spustite vstup, priložte kalibrátor 1 kHz / 94 dB a zvoľte Kalibrovať. Kalibrácia trvá najmenej 9 s.";
+"Sloupce na displeji zleva doprava. Přetažením nebo šipkami změňte pořadí." = "Stĺpce na displeji zľava doprava. Presunutím alebo šípkami zmeňte poradie.";
+"Sloupce na displeji: %d + hodiny" = "Stĺpce na displeji: %d + hodiny";
+"Hodiny" = "Hodiny";
+"Okamžité hodnoty" = "Okamžité hodnoty";
+"Hodnoty za 1 s" = "Hodnoty za 1 s";
+"Dlouhodobé Leq" = "Dlhodobé Leq";
+"Technické poznámky" = "Technické poznámky";
+"Během záznamu nelze metadata měnit." = "Počas záznamu nie je možné meniť metadáta.";
