@@ -1593,6 +1593,58 @@ enum SelfTest {
             failures.append("Transfer function average did not reset safely")
         }
 
+        func coherencePoint(crossReal: Double, crossImaginary: Double) -> TransferFunctionPoint {
+            let sums = TransferFunctionSpectralSums(
+                referencePower: 1,
+                measurementPower: 1,
+                crossReal: crossReal,
+                crossImaginary: crossImaginary
+            )
+            return TransferFunctionPoint(
+                frequency: 500,
+                magnitudeDB: 0,
+                coherence: sums.coherence,
+                spectralSums: sums
+            )
+        }
+        var coherentAverager = TransferFunctionAverager()
+        var incoherentAverager = TransferFunctionAverager()
+        var coherentResult: [TransferFunctionPoint] = []
+        var incoherentResult: [TransferFunctionPoint] = []
+        for index in 0..<2 {
+            coherentResult = coherentAverager.average(
+                points: [coherencePoint(crossReal: 1, crossImaginary: 0)],
+                frequencyScale: averagingScale,
+                capturedAtUptime: Double(index),
+                blockDuration: 1
+            )
+            // Per-block coherence is 1, but the cross-spectra cancel between blocks.
+            incoherentResult = incoherentAverager.average(
+                points: [coherencePoint(crossReal: index == 0 ? 1 : -1, crossImaginary: 0)],
+                frequencyScale: averagingScale,
+                capturedAtUptime: Double(index),
+                blockDuration: 1
+            )
+        }
+        if abs((coherentResult.first?.coherence ?? 0) - 1) > 1e-9
+            || (incoherentResult.first?.coherence ?? 1) > 1e-9 {
+            failures.append(
+                "Transfer function coherence was not derived from averaged cross-spectra"
+            )
+        }
+        if TransferFunctionTraceData.opacity(forCoherence: 1)
+                != TransferFunctionTraceData.maximumOpacity
+            || TransferFunctionTraceData.opacity(forCoherence: 0)
+                != TransferFunctionTraceData.minimumOpacity
+            || TransferFunctionTraceData.opacity(forCoherence: .nan)
+                != TransferFunctionTraceData.minimumOpacity
+            || !(TransferFunctionTraceData.opacity(forCoherence: 0.55)
+                > TransferFunctionTraceData.minimumOpacity
+                && TransferFunctionTraceData.opacity(forCoherence: 0.55)
+                < TransferFunctionTraceData.maximumOpacity) {
+            failures.append("Transfer function coherence opacity mapping was wrong")
+        }
+
         let sampleRate = 48_000.0
         let count = TransferFunctionDSP.analysisFrameCount(sampleRate: sampleRate)
         let delay = 480

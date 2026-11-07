@@ -3,6 +3,7 @@ import SwiftUI
 struct TransferFunctionTrace: View {
     // Overlap normal analysis updates so the live trace does not pause between curves.
     private static let transitionDuration: TimeInterval = 0.45
+    private static let traceColor = Color(red: 0.16, green: 0.82, blue: 1)
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -24,7 +25,16 @@ struct TransferFunctionTrace: View {
                     positions: data.positions
                 )
                 .stroke(
-                    Color(red: 0.16, green: 0.82, blue: 1).opacity(0.85),
+                    LinearGradient(
+                        stops: data.opacityStops.map {
+                            Gradient.Stop(
+                                color: Self.traceColor.opacity($0.opacity),
+                                location: $0.location
+                            )
+                        },
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    ),
                     style: StrokeStyle(lineWidth: 3, lineJoin: .round)
                 )
                 .frame(width: geometry.size.width, height: graphHeight)
@@ -46,8 +56,25 @@ struct TransferFunctionTraceData {
         let upperFrequency: Double
     }
 
+    static let maximumOpacity = 0.85
+    static let minimumOpacity = 0.12
+    /// Coherence (magnitude-squared) at or below which the trace is faintest.
+    static let lowCoherence = 0.3
+    /// Coherence at or above which the trace is fully opaque.
+    static let highCoherence = 0.8
+
     let topology: Topology
     let positions: TransferFunctionTraceVector
+    /// Horizontal gradient stops (0...1) fading the trace where coherence is low.
+    let opacityStops: [(location: Double, opacity: Double)]
+
+    static func opacity(forCoherence coherence: Double) -> Double {
+        guard coherence.isFinite else { return minimumOpacity }
+        let fraction = min(1, max(0,
+            (coherence - lowCoherence) / (highCoherence - lowCoherence)
+        ))
+        return minimumOpacity + fraction * (maximumOpacity - minimumOpacity)
+    }
 
     init?(
         points: [TransferFunctionPoint],
@@ -61,7 +88,7 @@ struct TransferFunctionTraceData {
               displayUpperDB.isFinite,
               levelSpan > 0 else { return nil }
 
-        var sourcePositions: [(horizontal: Double, vertical: Double)] = []
+        var sourcePositions: [(horizontal: Double, vertical: Double, coherence: Double)] = []
         sourcePositions.reserveCapacity(points.count)
         var previousFrequency = 0.0
         for point in points {
@@ -73,7 +100,8 @@ struct TransferFunctionTraceData {
             }
             sourcePositions.append((
                 horizontalPosition,
-                (displayUpperDB - point.magnitudeDB) / levelSpan
+                (displayUpperDB - point.magnitudeDB) / levelSpan,
+                point.coherence.isFinite ? min(1, max(0, point.coherence)) : 0
             ))
             previousFrequency = point.frequency
         }
@@ -87,6 +115,8 @@ struct TransferFunctionTraceData {
         )
         var positions: [Double] = []
         positions.reserveCapacity(canonicalFrequencies.count * 2)
+        var opacityStops: [(location: Double, opacity: Double)] = []
+        opacityStops.reserveCapacity(canonicalFrequencies.count)
         let first = sourcePositions[0]
         let last = sourcePositions[sourcePositions.count - 1]
         var sourceIndex = 0
@@ -101,21 +131,30 @@ struct TransferFunctionTraceData {
             }
 
             let vertical: Double
+            let coherence: Double
             if horizontal <= first.horizontal {
                 vertical = first.vertical
+                coherence = first.coherence
             } else if horizontal >= last.horizontal {
                 vertical = last.vertical
+                coherence = last.coherence
             } else {
                 let lower = sourcePositions[sourceIndex]
                 let upper = sourcePositions[sourceIndex + 1]
                 let fraction = (horizontal - lower.horizontal)
                     / (upper.horizontal - lower.horizontal)
                 vertical = lower.vertical + fraction * (upper.vertical - lower.vertical)
+                coherence = lower.coherence + fraction * (upper.coherence - lower.coherence)
             }
             positions.append(horizontal)
             positions.append(vertical)
+            opacityStops.append((
+                min(1, max(0, horizontal)),
+                Self.opacity(forCoherence: coherence)
+            ))
         }
         self.positions = TransferFunctionTraceVector(positions)
+        self.opacityStops = opacityStops
     }
 }
 

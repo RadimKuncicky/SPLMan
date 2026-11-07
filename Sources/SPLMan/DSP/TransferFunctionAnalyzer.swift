@@ -13,9 +13,41 @@ enum TransferFunctionValidity: Equatable {
     case invalidReference
 }
 
+/// Band-summed auto- and cross-spectra of one analysis block. Summing them over
+/// several blocks (and over the bins of a band) gives the magnitude-squared
+/// coherence estimate |Gxy|^2 / (Gxx * Gyy).
+struct TransferFunctionSpectralSums: Equatable {
+    var referencePower = 0.0
+    var measurementPower = 0.0
+    var crossReal = 0.0
+    var crossImaginary = 0.0
+
+    var coherence: Double {
+        let denominator = referencePower * measurementPower
+        guard denominator > 1e-300, denominator.isFinite else { return 0 }
+        let value = (crossReal * crossReal + crossImaginary * crossImaginary) / denominator
+        return value.isFinite ? min(1, max(0, value)) : 0
+    }
+}
+
 struct TransferFunctionPoint: Equatable {
     let frequency: Double
     let magnitudeDB: Double
+    /// Magnitude-squared coherence in 0...1 (1 = fully coherent).
+    let coherence: Double
+    let spectralSums: TransferFunctionSpectralSums?
+
+    init(
+        frequency: Double,
+        magnitudeDB: Double,
+        coherence: Double = 1,
+        spectralSums: TransferFunctionSpectralSums? = nil
+    ) {
+        self.frequency = frequency
+        self.magnitudeDB = magnitudeDB
+        self.coherence = coherence
+        self.spectralSums = spectralSums
+    }
 }
 
 struct TransferFunctionCurve: Equatable {
@@ -309,9 +341,21 @@ enum TransferFunctionDSP {
                 sampleRate: frame.sampleRate
             )
             guard magnitude.isFinite, magnitude > 1e-12 else { continue }
+            let sums = bandSpectralSums(
+                frequency: frequency,
+                binWidth: binWidth,
+                nearestBin: nearestBin,
+                count: count,
+                referenceReal: referenceReal,
+                referenceImaginary: referenceImaginary,
+                measurementReal: measurementReal,
+                measurementImaginary: measurementImaginary
+            )
             points.append(TransferFunctionPoint(
                 frequency: frequency,
-                magnitudeDB: 20 * log10(magnitude)
+                magnitudeDB: 20 * log10(magnitude),
+                coherence: sums.coherence,
+                spectralSums: sums
             ))
         }
         guard points.count >= max(6, frequencies.count / 3) else {
@@ -373,6 +417,39 @@ enum TransferFunctionDSP {
         let center = previousCenter + alpha * (currentCenter - previousCenter)
         let halfSpan = (current.upper - current.lower) / 2
         return (center - halfSpan, center + halfSpan)
+    }
+
+    private static func bandSpectralSums(
+        frequency: Double,
+        binWidth: Double,
+        nearestBin: Int,
+        count: Int,
+        referenceReal: [Double],
+        referenceImaginary: [Double],
+        measurementReal: [Double],
+        measurementImaginary: [Double]
+    ) -> TransferFunctionSpectralSums {
+        let bounds = SpectrogramAnalyzer.nominalSmoothingFrequencyBounds(
+            centerFrequency: frequency
+        )
+        var lowerBin = max(1, Int(ceil(bounds.lower / binWidth)))
+        var upperBin = min(count / 2, Int(floor(bounds.upper / binWidth)))
+        if lowerBin > upperBin {
+            lowerBin = nearestBin
+            upperBin = nearestBin
+        }
+        var sums = TransferFunctionSpectralSums()
+        for bin in lowerBin...upperBin {
+            let xr = referenceReal[bin]
+            let xi = referenceImaginary[bin]
+            let yr = measurementReal[bin]
+            let yi = measurementImaginary[bin]
+            sums.referencePower += xr * xr + xi * xi
+            sums.measurementPower += yr * yr + yi * yi
+            sums.crossReal += yr * xr + yi * xi
+            sums.crossImaginary += yi * xr - yr * xi
+        }
+        return sums
     }
 
     private static func normalizedCorrelation(
