@@ -423,6 +423,19 @@ struct SettingsView: View {
                                 validation: SpectrogramSettings.validatedTransferFunctionRange
                             )
                         }
+
+                        settingRow(L10n.text("Vyhlazení")) {
+                            Picker(
+                                L10n.text("Vyhlazení"),
+                                selection: $model.settings.spectrogram.transferFunctionSmoothing
+                            ) {
+                                ForEach(TransferFunctionSmoothing.allCases) { smoothing in
+                                    Text(smoothing.title).tag(smoothing)
+                                }
+                            }
+                            .labelsHidden()
+                            .fixedSize()
+                        }
                     }
                 }
 

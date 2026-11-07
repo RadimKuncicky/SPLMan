@@ -70,6 +70,10 @@ enum TransferFunctionDSP {
     static let minimumWindowDuration = 0.004
     static let automaticGainFrequencyRange = 500.0...4_000.0
     static let automaticGainSmoothingTimeConstant: TimeInterval = 1
+    /// Analysis grid of the transfer function. It is at least as fine as the
+    /// finest selectable smoothing, so the smoothing, not the grid, sets the
+    /// displayed resolution.
+    static let gridBandsPerOctave = 48
     private static let preferredMaximumWindowDuration = 0.120
     private static let preferredMaximumDelayDuration = 0.100
     private static let preWindowDuration = 0.002
@@ -94,15 +98,31 @@ enum TransferFunctionDSP {
         return frameCount
     }
 
+    static func gridFrequencies(for scale: SpectrogramFrequencyScale) -> [Double] {
+        SpectrogramAnalyzer.bandCenterFrequencies(
+            for: scale,
+            bandsPerOctave: gridBandsPerOctave
+        )
+    }
+
+    /// Cycles in the frequency-dependent impulse-response window. A finer
+    /// smoothing needs a longer window to resolve its bands; coarser
+    /// smoothings keep the original six-cycle window that suppresses late
+    /// reflections.
+    static func windowCycles(for smoothing: TransferFunctionSmoothing) -> Double {
+        max(cyclesInWindow, Double(smoothing.bandsPerOctave))
+    }
+
     static func windowDuration(
         for frequency: Double,
         sampleRate: Double,
-        frameCount: Int = SpectrogramAnalyzer.fftSize
+        frameCount: Int = SpectrogramAnalyzer.fftSize,
+        cycles: Double = TransferFunctionDSP.cyclesInWindow
     ) -> TimeInterval {
-        guard frequency > 0, sampleRate > 0, frameCount > 2 else { return 0 }
+        guard frequency > 0, sampleRate > 0, frameCount > 2, cycles > 0 else { return 0 }
         let requestedDuration = min(
             preferredMaximumWindowDuration,
-            max(minimumWindowDuration, cyclesInWindow / frequency)
+            max(minimumWindowDuration, cycles / frequency)
         )
         let maximumRepresentableDuration = Double(frameCount / 2 - 1) / sampleRate
         return min(requestedDuration, maximumRepresentableDuration)
@@ -132,7 +152,8 @@ enum TransferFunctionDSP {
     static func analyze(
         frame: TransferSignalFrame,
         range: SpectrogramFrequencyRange,
-        preferredDelaySamples: Double? = nil
+        preferredDelaySamples: Double? = nil,
+        smoothing: TransferFunctionSmoothing = .default
     ) -> TransferFunctionAnalysis {
         let count = frame.measurement.count
         guard count >= SpectrogramAnalyzer.fftSize,
@@ -328,7 +349,8 @@ enum TransferFunctionDSP {
         }
         fft(real: &transferReal, imaginary: &transferImaginary, inverse: true)
 
-        let frequencies = SpectrogramAnalyzer.bandCenterFrequencies(for: scale)
+        let frequencies = gridFrequencies(for: scale)
+        let cycles = windowCycles(for: smoothing)
         let binWidth = frame.sampleRate / Double(count)
         var points: [TransferFunctionPoint] = []
         points.reserveCapacity(frequencies.count)
@@ -338,7 +360,8 @@ enum TransferFunctionDSP {
             let magnitude = gatedMagnitude(
                 impulseResponse: transferReal,
                 frequency: frequency,
-                sampleRate: frame.sampleRate
+                sampleRate: frame.sampleRate,
+                cycles: cycles
             )
             guard magnitude.isFinite, magnitude > 1e-12 else { continue }
             let sums = bandSpectralSums(
@@ -419,6 +442,58 @@ enum TransferFunctionDSP {
         return (center - halfSpan, center + halfSpan)
     }
 
+    /// Fractional-octave smoothing on the analysis grid: each point becomes
+    /// the power average of |H|² over a 1/N-octave band centred on it, and its
+    /// coherence the average coherence over the same band. Every grid point
+    /// covers one grid step, so a band edge falling halfway into a step gets
+    /// half weight. Missing points simply drop out of the average.
+    static func smoothed(
+        _ points: [TransferFunctionPoint],
+        smoothing: TransferFunctionSmoothing
+    ) -> [TransferFunctionPoint] {
+        let stepsPerOctave = Double(gridBandsPerOctave)
+        let halfWidth = stepsPerOctave / (2 * Double(smoothing.bandsPerOctave))
+        guard halfWidth > 0.5, points.count > 1 else { return points }
+
+        let positions = points.map { log2($0.frequency) * stepsPerOctave }
+        let powers = points.map { pow(10, $0.magnitudeDB / 10) }
+        var lowerIndex = 0
+        var upperIndex = 0
+        return points.indices.map { index -> TransferFunctionPoint in
+            let center = positions[index]
+            while positions[lowerIndex] <= center - halfWidth - 0.5 {
+                lowerIndex += 1
+            }
+            while upperIndex + 1 < points.count,
+                  positions[upperIndex + 1] < center + halfWidth + 0.5 {
+                upperIndex += 1
+            }
+            var weightSum = 0.0
+            var power = 0.0
+            var coherence = 0.0
+            for neighbor in lowerIndex...upperIndex {
+                let weight = min(
+                    1,
+                    max(0, halfWidth + 0.5 - abs(positions[neighbor] - center))
+                )
+                guard weight > 0 else { continue }
+                weightSum += weight
+                power += weight * powers[neighbor]
+                coherence += weight * points[neighbor].coherence
+            }
+            let averagePower = power / weightSum
+            guard weightSum > 0,
+                  averagePower > 0,
+                  averagePower.isFinite else { return points[index] }
+            return TransferFunctionPoint(
+                frequency: points[index].frequency,
+                magnitudeDB: 10 * log10(averagePower),
+                coherence: min(1, max(0, coherence / weightSum)),
+                spectralSums: points[index].spectralSums
+            )
+        }
+    }
+
     private static func bandSpectralSums(
         frequency: Double,
         binWidth: Double,
@@ -482,13 +557,15 @@ enum TransferFunctionDSP {
     static func gatedMagnitude(
         impulseResponse: [Double],
         frequency: Double,
-        sampleRate: Double
+        sampleRate: Double,
+        cycles: Double = TransferFunctionDSP.cyclesInWindow
     ) -> Double {
         let count = impulseResponse.count
         let effectiveWindowDuration = windowDuration(
             for: frequency,
             sampleRate: sampleRate,
-            frameCount: count
+            frameCount: count,
+            cycles: cycles
         )
         let postSamples = min(
             count / 2 - 1,
@@ -634,6 +711,7 @@ final class TransferFunctionAnalyzer: @unchecked Sendable {
     private var isWorkerRunning = false
     private var pendingFrames: [TransferSignalFrame] = []
     private var pendingRange: SpectrogramFrequencyRange = .full
+    private var pendingSmoothing: TransferFunctionSmoothing = .default
     private var pendingCompletion: (@MainActor (TransferFunctionAnalysis) -> Void)?
     private var pendingReset = false
 
@@ -646,6 +724,7 @@ final class TransferFunctionAnalyzer: @unchecked Sendable {
     private var expectedNextFrameUptime: TimeInterval?
     private var previousDelaySamples: Double?
     private var previousCurve: TransferFunctionCurve?
+    private var processedSmoothing: TransferFunctionSmoothing?
     private var curveAverager = TransferFunctionAverager()
 
     func invalidate() {
@@ -659,6 +738,7 @@ final class TransferFunctionAnalyzer: @unchecked Sendable {
     func analyze(
         _ frames: [TransferSignalFrame],
         range: SpectrogramFrequencyRange,
+        smoothing: TransferFunctionSmoothing = .default,
         completion: @escaping @MainActor (TransferFunctionAnalysis) -> Void
     ) {
         guard !frames.isEmpty else { return }
@@ -683,6 +763,7 @@ final class TransferFunctionAnalyzer: @unchecked Sendable {
             pendingReset = true
         }
         pendingRange = range
+        pendingSmoothing = smoothing
         pendingCompletion = completion
         let shouldStartWorker = !isWorkerRunning
         if shouldStartWorker { isWorkerRunning = true }
@@ -701,6 +782,7 @@ final class TransferFunctionAnalyzer: @unchecked Sendable {
             let frames = pendingFrames
             pendingFrames.removeAll(keepingCapacity: true)
             let range = pendingRange
+            let smoothing = pendingSmoothing
             let completion = pendingCompletion
             let requestedGeneration = generation
             let shouldReset = pendingReset
@@ -715,10 +797,18 @@ final class TransferFunctionAnalyzer: @unchecked Sendable {
                     preservingCurveHistory: true
                 )
             }
+            if processedSmoothing != smoothing {
+                // The smoothing sets the impulse-response window length, so
+                // blocks analysed with a different window must not be averaged
+                // into the new curve. Delay tracking and AutoGain are kept.
+                processedSmoothing = smoothing
+                curveAverager.reset()
+            }
             for frame in frames {
                 append(
                     frame,
                     range: range,
+                    smoothing: smoothing,
                     generation: requestedGeneration,
                     completion: completion
                 )
@@ -729,6 +819,7 @@ final class TransferFunctionAnalyzer: @unchecked Sendable {
     private func append(
         _ frame: TransferSignalFrame,
         range: SpectrogramFrequencyRange,
+        smoothing: TransferFunctionSmoothing,
         generation: UInt64,
         completion: (@MainActor (TransferFunctionAnalysis) -> Void)?
     ) {
@@ -775,11 +866,13 @@ final class TransferFunctionAnalyzer: @unchecked Sendable {
                     capturedAtUptime: blockStart
                 ),
                 range: range,
-                preferredDelaySamples: previousDelaySamples
+                preferredDelaySamples: previousDelaySamples,
+                smoothing: smoothing
             )
             analysis = averaged(
                 analysis,
-                blockDuration: Double(blockSize) / frame.sampleRate
+                blockDuration: Double(blockSize) / frame.sampleRate,
+                smoothing: smoothing
             )
             if let curve = analysis.curve {
                 previousDelaySamples = curve.delaySeconds * frame.sampleRate
@@ -791,14 +884,20 @@ final class TransferFunctionAnalyzer: @unchecked Sendable {
 
     private func averaged(
         _ analysis: TransferFunctionAnalysis,
-        blockDuration: TimeInterval
+        blockDuration: TimeInterval,
+        smoothing: TransferFunctionSmoothing
     ) -> TransferFunctionAnalysis {
         guard let curve = analysis.curve else { return analysis }
-        let averagedPoints = curveAverager.average(
-            points: curve.points,
-            frequencyScale: curve.frequencyScale,
-            capturedAtUptime: curve.capturedAtUptime,
-            blockDuration: blockDuration
+        // Smooth after time averaging so the coherence still comes from the
+        // averaged cross-spectra of each grid band.
+        let averagedPoints = TransferFunctionDSP.smoothed(
+            curveAverager.average(
+                points: curve.points,
+                frequencyScale: curve.frequencyScale,
+                capturedAtUptime: curve.capturedAtUptime,
+                blockDuration: blockDuration
+            ),
+            smoothing: smoothing
         )
         let automaticDisplayRange = TransferFunctionDSP.automaticDisplayRange(
             averagedPoints

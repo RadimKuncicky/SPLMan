@@ -27,6 +27,7 @@ enum SelfTest {
         testSpectrogramAnalyzer(&failures)
         testSpectrogramTimeline(&failures)
         testTransferFunctionAnalyzer(&failures)
+        testTransferFunctionSmoothing(&failures)
         testTransferFunctionDisplayState(&failures)
         testTransferFunctionTraceVector(&failures)
         testThresholds(&failures)
@@ -720,6 +721,10 @@ enum SelfTest {
             || defaultSpectrogram.displayMode != .none {
             failures.append("Analysis defaults were not 100/50 dB and TF ±12 dB")
         }
+        if defaultSpectrogram.transferFunctionSmoothing != .oneSixth
+            || TransferFunctionSmoothing.allCases.map(\.bandsPerOctave) != [48, 24, 12, 6, 3, 1] {
+            failures.append("Transfer function smoothing defaults or options changed")
+        }
         if AnalysisDisplayMode.spectrogram.next != .transferFunction
             || AnalysisDisplayMode.transferFunction.next != .combined
             || AnalysisDisplayMode.combined.next != .none
@@ -767,6 +772,7 @@ enum SelfTest {
             upperLevelDB: 108,
             dynamicRangeDB: 64,
             transferFunctionRangeDB: 24,
+            transferFunctionSmoothing: .oneTwentyFourth,
             referenceChannel: 1
         )
         do {
@@ -834,6 +840,7 @@ enum SelfTest {
             nestedSpectrogram.removeValue(forKey: "displayMode")
             nestedSpectrogram.removeValue(forKey: "isTransferFunctionEnabled")
             nestedSpectrogram.removeValue(forKey: "referenceChannel")
+            nestedSpectrogram.removeValue(forKey: "transferFunctionSmoothing")
             nestedLegacyObject["spectrogram"] = nestedSpectrogram
             let nestedLegacyData = try PropertyListSerialization.data(
                 fromPropertyList: nestedLegacyObject,
@@ -849,6 +856,7 @@ enum SelfTest {
                 || nestedLegacyDecoded.spectrogram.transferFunctionRangeDB != 12
                 || nestedLegacyDecoded.spectrogram.palette != .current
                 || nestedLegacyDecoded.spectrogram.displayMode != .spectrogram
+                || nestedLegacyDecoded.spectrogram.transferFunctionSmoothing != .default
                 || nestedLegacyDecoded.spectrogram.referenceChannel != nil {
                 failures.append("Legacy analysis settings did not receive current level defaults")
             }
@@ -856,6 +864,31 @@ enum SelfTest {
                 || nestedLegacyDecoded.spectrogram.historyDuration != .long
                 || nestedLegacyDecoded.spectrogram.intensity != .high {
                 failures.append("Legacy spectrogram settings lost their existing fields")
+            }
+
+            guard var unknownSmoothingObject = try PropertyListSerialization.propertyList(
+                from: encoded,
+                format: nil
+            ) as? [String: Any],
+            var unknownSmoothingSpectrogram = unknownSmoothingObject["spectrogram"]
+                as? [String: Any] else {
+                failures.append("Unknown smoothing fixture could not be created")
+                return
+            }
+            unknownSmoothingSpectrogram["transferFunctionSmoothing"] = 7
+            unknownSmoothingObject["spectrogram"] = unknownSmoothingSpectrogram
+            let unknownSmoothingDecoded = try PropertyListDecoder().decode(
+                PersistedSettings.self,
+                from: PropertyListSerialization.data(
+                    fromPropertyList: unknownSmoothingObject,
+                    format: .binary,
+                    options: 0
+                )
+            )
+            var expectedUnknownSmoothing = settings.spectrogram
+            expectedUnknownSmoothing.transferFunctionSmoothing = .default
+            if unknownSmoothingDecoded.spectrogram != expectedUnknownSmoothing {
+                failures.append("Unknown transfer function smoothing reset other analysis settings")
             }
         } catch {
             failures.append("Settings persistence failed: \(error.localizedDescription)")
@@ -877,17 +910,19 @@ enum SelfTest {
             failures.append("Spectrogram did not produce a valid focused frequency scale")
             return
         }
-        let transferFunctionFrequencies = SpectrogramAnalyzer.bandCenterFrequencies(
+        let transferFunctionFrequencies = TransferFunctionDSP.gridFrequencies(
             for: focusedScale
         )
-        let expectedStep = pow(2, 1.0 / 24)
+        let transferFunctionStep = pow(2, 1.0 / 48)
         if transferFunctionFrequencies.count < 2
             || transferFunctionFrequencies.dropFirst().enumerated().contains(where: {
                 index, frequency in
-                abs(frequency / transferFunctionFrequencies[index] - expectedStep) > 1e-12
+                abs(frequency / transferFunctionFrequencies[index] - transferFunctionStep)
+                    > 1e-12
             }) {
-            failures.append("Transfer-function bands were not spaced at 1/24 octave")
+            failures.append("Transfer-function bands were not spaced at 1/48 octave")
         }
+        let expectedStep = pow(2, 1.0 / 24)
         let binWidth = sampleRate / Double(frameCount)
         let centerFrequencies = SpectrogramAnalyzer.spectrogramCenterFrequencies(
             for: focusedScale,
@@ -1742,6 +1777,34 @@ enum SelfTest {
         if abs(medianLevel - 20 * log10(gain)) > 1.0 {
             failures.append("Transfer function did not recover a known broadband gain")
         }
+        for smoothing in [TransferFunctionSmoothing.oneFortyEighth, .oneOctave] {
+            let smoothingAnalysis = TransferFunctionDSP.analyze(
+                frame: TransferSignalFrame(
+                    measurement: measurement,
+                    reference: reference,
+                    sampleRate: sampleRate,
+                    capturedAtUptime: 1
+                ),
+                range: .focused,
+                smoothing: smoothing
+            )
+            let smoothedLevels = TransferFunctionDSP.smoothed(
+                smoothingAnalysis.curve?.points ?? [],
+                smoothing: smoothing
+            )
+            .filter { $0.frequency >= 200 && $0.frequency <= 5_000 }
+            .map(\.magnitudeDB)
+            .sorted()
+            let smoothedMedian = smoothedLevels.isEmpty
+                ? .infinity
+                : smoothedLevels[smoothedLevels.count / 2]
+            if smoothingAnalysis.validity != .valid
+                || abs(smoothedMedian - 20 * log10(gain)) > 1.0 {
+                failures.append(
+                    "Transfer function with \(smoothing.bandsPerOctave)-band smoothing did not recover a known gain"
+                )
+            }
+        }
         let automaticGainPoints = curve.points.filter {
             TransferFunctionDSP.automaticGainFrequencyRange.contains($0.frequency)
         }
@@ -2133,6 +2196,102 @@ enum SelfTest {
         }
     }
 
+    private static func testTransferFunctionSmoothing(_ failures: inout [String]) {
+        guard let scale = SpectrogramFrequencyScale(
+            sampleRate: 48_000,
+            frameCount: SpectrogramAnalyzer.fftSize,
+            range: .focused
+        ) else {
+            failures.append("Transfer function smoothing scale was invalid")
+            return
+        }
+        let frequencies = TransferFunctionDSP.gridFrequencies(for: scale)
+        let spikeIndex = frequencies.count / 2
+        guard spikeIndex >= TransferFunctionDSP.gridBandsPerOctave,
+              spikeIndex + TransferFunctionDSP.gridBandsPerOctave < frequencies.count else {
+            failures.append("Transfer function smoothing grid was too short")
+            return
+        }
+        let flat = frequencies.map {
+            TransferFunctionPoint(frequency: $0, magnitudeDB: -6, coherence: 0.9)
+        }
+        let spikeLevelDB = 12.0
+        let spike = frequencies.indices.map { index in
+            TransferFunctionPoint(
+                frequency: frequencies[index],
+                magnitudeDB: index == spikeIndex ? spikeLevelDB : 0,
+                coherence: index == spikeIndex ? 0 : 1
+            )
+        }
+
+        var previousPeak = Double.infinity
+        for smoothing in TransferFunctionSmoothing.allCases {
+            let smoothedFlat = TransferFunctionDSP.smoothed(flat, smoothing: smoothing)
+            if smoothedFlat.count != flat.count
+                || zip(smoothedFlat, flat).contains(where: { $0.frequency != $1.frequency })
+                || smoothedFlat.contains(where: {
+                    abs($0.magnitudeDB + 6) > 1e-9 || abs($0.coherence - 0.9) > 1e-9
+                }) {
+                failures.append(
+                    "Transfer function \(smoothing.bandsPerOctave)-band smoothing changed a flat response"
+                )
+            }
+
+            let smoothedSpike = TransferFunctionDSP.smoothed(spike, smoothing: smoothing)
+            guard smoothedSpike.count == spike.count else {
+                failures.append("Transfer function smoothing dropped points")
+                continue
+            }
+            // A 1/N-octave band spans 48/N grid steps; the spike keeps full
+            // weight and the remaining weight falls on 0 dB neighbours.
+            let bandSteps = Double(TransferFunctionDSP.gridBandsPerOctave)
+                / Double(smoothing.bandsPerOctave)
+            let expectedPeak = bandSteps <= 1
+                ? spikeLevelDB
+                : 10 * log10((pow(10, spikeLevelDB / 10) + bandSteps - 1) / bandSteps)
+            let expectedCoherence = bandSteps <= 1 ? 0 : (bandSteps - 1) / bandSteps
+            let peak = smoothedSpike[spikeIndex].magnitudeDB
+            if abs(peak - expectedPeak) > 1e-6
+                || abs(smoothedSpike[spikeIndex].coherence - expectedCoherence) > 1e-6
+                || peak > previousPeak + 1e-9 {
+                failures.append(
+                    String(
+                        format: "Transfer function %d-band smoothing peak was %.3f dB, expected %.3f dB",
+                        smoothing.bandsPerOctave,
+                        peak,
+                        expectedPeak
+                    )
+                )
+            }
+            previousPeak = peak
+        }
+        if TransferFunctionDSP.smoothed(spike, smoothing: .oneFortyEighth) != spike {
+            failures.append("Transfer function 1/48-octave smoothing altered the analysis grid")
+        }
+
+        var gappedSpike = spike
+        gappedSpike.remove(at: spikeIndex + 1)
+        let smoothedGap = TransferFunctionDSP.smoothed(gappedSpike, smoothing: .oneSixth)
+        if smoothedGap.count != gappedSpike.count
+            || smoothedGap.contains(where: { !$0.magnitudeDB.isFinite }) {
+            failures.append("Transfer function smoothing mishandled a missing band")
+        }
+
+        if TransferFunctionDSP.windowCycles(for: .default) != TransferFunctionDSP.cyclesInWindow
+            || TransferFunctionDSP.windowCycles(for: .oneOctave) != TransferFunctionDSP.cyclesInWindow
+            || TransferFunctionDSP.windowCycles(for: .oneFortyEighth) != 48
+            || abs(
+                TransferFunctionDSP.windowDuration(
+                    for: 1_000,
+                    sampleRate: 48_000,
+                    frameCount: TransferFunctionDSP.analysisFrameCount(sampleRate: 48_000),
+                    cycles: TransferFunctionDSP.windowCycles(for: .oneFortyEighth)
+                ) - 0.048
+            ) > 1e-12 {
+            failures.append("Transfer function smoothing did not scale the IR window")
+        }
+    }
+
     private static func testTransferFunctionDisplayState(_ failures: inout [String]) {
         guard let frequencyScale = SpectrogramFrequencyScale(
             sampleRate: 48_000,
@@ -2341,7 +2500,7 @@ enum SelfTest {
             failures.append("Transfer function trace scales were invalid")
             return
         }
-        let frequencies = SpectrogramAnalyzer.bandCenterFrequencies(for: scale)
+        let frequencies = TransferFunctionDSP.gridFrequencies(for: scale)
         guard frequencies.count > 12 else {
             failures.append("Transfer function trace grid was too short")
             return

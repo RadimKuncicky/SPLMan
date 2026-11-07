@@ -110,7 +110,7 @@ struct TransferFunctionTraceData {
             lowerFrequency: frequencyScale.lowerFrequency,
             upperFrequency: frequencyScale.upperFrequency
         )
-        let canonicalFrequencies = SpectrogramAnalyzer.bandCenterFrequencies(
+        let canonicalFrequencies = TransferFunctionDSP.gridFrequencies(
             for: frequencyScale
         )
         var positions: [Double] = []

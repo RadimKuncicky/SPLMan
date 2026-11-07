@@ -501,15 +501,19 @@ final class MeterModel: ObservableObject {
                     capturedAtUptime: capturedEndUptime
                 )
             }
+            let smoothing = settings.spectrogram.transferFunctionSmoothing
             transferFunctionAnalyzer.analyze(
                 transferFrames,
-                range: frequencyRange
+                range: frequencyRange,
+                smoothing: smoothing
             ) { [weak self] analysis in
                 guard let self,
                       self.isRunning,
                       self.settings.spectrogram.displayMode.showsTransferFunction,
                       self.activeReferenceChannel != nil,
-                      self.settings.spectrogram.frequencyRange == frequencyRange else { return }
+                      self.settings.spectrogram.frequencyRange == frequencyRange,
+                      self.settings.spectrogram.transferFunctionSmoothing == smoothing
+                else { return }
                 self.transferFunctionAnalysis = self.transferFunctionDisplayState.update(
                     with: analysis,
                     at: ProcessInfo.processInfo.systemUptime

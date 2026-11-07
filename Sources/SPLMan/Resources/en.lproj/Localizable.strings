@@ -202,3 +202,6 @@
 "Dlouhodobé Leq" = "Long-Term Leq";
 "Technické poznámky" = "Technical Notes";
 "Během záznamu nelze metadata měnit." = "Metadata cannot be changed while recording.";
+"Vyhlazení" = "Smoothing";
+"1/%d oktávy" = "1/%d octave";
+"1 oktáva" = "1 octave";

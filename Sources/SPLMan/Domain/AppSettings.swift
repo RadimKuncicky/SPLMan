@@ -96,6 +96,28 @@ enum SpectrogramPalette: String, CaseIterable, Codable, Identifiable {
     }
 }
 
+/// Fractional-octave smoothing of the transfer-function trace. The raw value
+/// is the number of smoothing bands per octave.
+enum TransferFunctionSmoothing: Int, CaseIterable, Codable, Identifiable {
+    case oneFortyEighth = 48
+    case oneTwentyFourth = 24
+    case oneTwelfth = 12
+    case oneSixth = 6
+    case oneThird = 3
+    case oneOctave = 1
+
+    static let `default`: TransferFunctionSmoothing = .oneSixth
+
+    var id: Int { rawValue }
+    var bandsPerOctave: Int { rawValue }
+
+    var title: String {
+        self == .oneOctave
+            ? L10n.text("1 oktáva")
+            : L10n.format("1/%d oktávy", Int32(rawValue))
+    }
+}
+
 enum AnalysisDisplayMode: String, CaseIterable, Codable, Identifiable {
     case spectrogram
     case transferFunction
@@ -147,6 +169,7 @@ struct SpectrogramSettings: Codable, Equatable {
     var upperLevelDB = defaultUpperLevelDB
     var dynamicRangeDB = defaultDynamicRangeDB
     var transferFunctionRangeDB = defaultTransferFunctionRangeDB
+    var transferFunctionSmoothing: TransferFunctionSmoothing = .default
     var referenceChannel: Int?
 
     private enum CodingKeys: String, CodingKey {
@@ -160,6 +183,7 @@ struct SpectrogramSettings: Codable, Equatable {
         case upperLevelDB
         case dynamicRangeDB
         case transferFunctionRangeDB
+        case transferFunctionSmoothing
         case isTransferFunctionEnabled
         case referenceChannel
     }
@@ -173,6 +197,7 @@ struct SpectrogramSettings: Codable, Equatable {
         upperLevelDB: Double = defaultUpperLevelDB,
         dynamicRangeDB: Double = defaultDynamicRangeDB,
         transferFunctionRangeDB: Double = defaultTransferFunctionRangeDB,
+        transferFunctionSmoothing: TransferFunctionSmoothing = .default,
         referenceChannel: Int? = nil
     ) {
         self.displayMode = displayMode
@@ -185,6 +210,7 @@ struct SpectrogramSettings: Codable, Equatable {
         self.transferFunctionRangeDB = Self.validatedTransferFunctionRange(
             transferFunctionRangeDB
         )
+        self.transferFunctionSmoothing = transferFunctionSmoothing
         self.referenceChannel = referenceChannel
     }
 
@@ -237,6 +263,12 @@ struct SpectrogramSettings: Codable, Equatable {
             try container.decodeIfPresent(Double.self, forKey: .transferFunctionRangeDB)
                 ?? Self.defaultTransferFunctionRangeDB
         )
+        // An unknown smoothing (for example from a newer version) falls back
+        // to the default instead of resetting every analysis setting.
+        transferFunctionSmoothing = (try? container.decodeIfPresent(
+            TransferFunctionSmoothing.self,
+            forKey: .transferFunctionSmoothing
+        )) ?? .default
         referenceChannel = try container.decodeIfPresent(Int.self, forKey: .referenceChannel)
     }
 
@@ -252,6 +284,7 @@ struct SpectrogramSettings: Codable, Equatable {
         try container.encode(upperLevelDB, forKey: .upperLevelDB)
         try container.encode(dynamicRangeDB, forKey: .dynamicRangeDB)
         try container.encode(transferFunctionRangeDB, forKey: .transferFunctionRangeDB)
+        try container.encode(transferFunctionSmoothing, forKey: .transferFunctionSmoothing)
         try container.encodeIfPresent(referenceChannel, forKey: .referenceChannel)
     }
 

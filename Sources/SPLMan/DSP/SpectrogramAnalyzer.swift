@@ -501,7 +501,7 @@ final class SpectrogramAnalyzer: @unchecked Sendable {
     /// Each native bin is normalized to the nominal 1/24-octave bandwidth so
     /// the fixed crossover does not introduce a level step, but bins are never
     /// merged below the crossover. Transfer-function analysis keeps its
-    /// independent 1/24-octave grid.
+    /// independent, finer grid (`TransferFunctionDSP.gridFrequencies`).
     static func spectrogramCenterFrequencies(
         for scale: SpectrogramFrequencyScale,
         binWidth: Double
@@ -534,7 +534,10 @@ final class SpectrogramAnalyzer: @unchecked Sendable {
         return 3 * binWidth / (unitBounds.upper - unitBounds.lower)
     }
 
-    static func bandCenterFrequencies(for scale: SpectrogramFrequencyScale) -> [Double] {
+    static func bandCenterFrequencies(
+        for scale: SpectrogramFrequencyScale,
+        bandsPerOctave: Int = SpectrogramAnalyzer.bandsPerOctave
+    ) -> [Double] {
         let octaveSpan = log2(scale.upperFrequency / scale.lowerFrequency)
         let intervalCount = max(1, Int(floor(octaveSpan * Double(bandsPerOctave))))
         return (0...intervalCount).map { index in
