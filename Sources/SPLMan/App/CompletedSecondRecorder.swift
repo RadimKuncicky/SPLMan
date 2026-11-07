@@ -23,14 +23,6 @@ final class CompletedSecondRecorder: @unchecked Sendable {
     private var lastCompletedSecondCount: UInt64?
     private var lastTimestamp: Date?
     private var hasAppendedSample = false
-    private var pendingDroppedIntervals: UInt64 = 0
-    // Discontinuities reported by health events but not yet carried by a
-    // delivered interval. Gap rows are written from the interval-attached
-    // counts so they stay in stream order; only a remainder at stop() becomes
-    // a trailing gap.
-    private var unattributedDiscontinuityEvents: Int64 = 0
-    private var unattributedMissingFrames: Int64 = 0
-    private var unattributedDiscardedPartialFrames: Int64 = 0
     private var dropoutCount = 0
     private var clippingDetected = false
     private var exceededLimits: Set<Metric> = []
@@ -77,8 +69,14 @@ final class CompletedSecondRecorder: @unchecked Sendable {
         queue.sync {
             timer?.cancel()
             timer = nil
+            // Gap rows are written from interval-attached counts so they stay
+            // in stream order. Only what the stream reports after the last
+            // drained interval becomes a trailing gap; health event counters
+            // are not used for this because they are read at a different
+            // moment than the queue and would race with it.
+            let tail = engine.currentStreamTail()
             drain()
-            appendTrailingGapIfNeeded()
+            appendTrailingGapIfNeeded(tail)
         }
     }
 
@@ -156,12 +154,8 @@ final class CompletedSecondRecorder: @unchecked Sendable {
                 type: .audioDropout,
                 metadata: metadata
             ), onError: onError)
-            unattributedDiscontinuityEvents &+= Int64(clamping: increment)
-            unattributedMissingFrames &+= Int64(clamping: health.missingFrameCount)
-            unattributedDiscardedPartialFrames &+= Int64(clamping: health.discardedPartialFrameCount)
         }
         if health.droppedSecondIntervalCount > 0 {
-            pendingDroppedIntervals &+= health.droppedSecondIntervalCount
             dropoutCount += Int(clamping: health.droppedSecondIntervalCount)
             didChangeStatus = true
             logger.append(MeasurementEvent(
@@ -185,9 +179,6 @@ final class CompletedSecondRecorder: @unchecked Sendable {
         let raw = completed.snapshot
         let intervalStart = completed.intervalEndUTC.addingTimeInterval(-1)
         if completed.precedingDiscontinuityEvents > 0 {
-            unattributedDiscontinuityEvents &-= Int64(clamping: completed.precedingDiscontinuityEvents)
-            unattributedMissingFrames &-= Int64(clamping: completed.precedingMissingFrames)
-            unattributedDiscardedPartialFrames &-= Int64(clamping: completed.precedingDiscardedPartialFrames)
             // A discontinuity before the first full post-REC interval is
             // already covered by the initial partial-second exclusion.
             if hasAppendedSample || intervalStart >= sessionStartedAt {
@@ -212,8 +203,6 @@ final class CompletedSecondRecorder: @unchecked Sendable {
                 lostSecondIntervals: sequenceGap,
                 atRecordingStart: !hasAppendedSample
             ), onError: onError)
-            pendingDroppedIntervals = pendingDroppedIntervals > sequenceGap
-                ? pendingDroppedIntervals - sequenceGap : 0
         }
 
         if !hasAppendedSample,
@@ -362,38 +351,72 @@ final class CompletedSecondRecorder: @unchecked Sendable {
         return metadata
     }
 
-    private func appendTrailingGapIfNeeded() {
+    private func appendTrailingGapIfNeeded(_ tail: AudioStreamTail?) {
         let endedAt = Date()
-        if unattributedDiscontinuityEvents > 0 {
+        let loss = Self.trailingLoss(
+            tail: tail,
+            lastTakenCompletedSecondCount: lastCompletedSecondCount
+        )
+        if loss.discontinuityEvents > 0 {
             logger.appendGap(Self.makeDiscontinuityGap(
                 sessionID: sessionID,
                 lastIntervalEnd: lastTimestamp,
                 nextIntervalStart: endedAt,
                 sessionStartedAt: sessionStartedAt,
-                eventCount: UInt64(unattributedDiscontinuityEvents),
-                missingFrameCount: UInt64(max(0, unattributedMissingFrames)),
-                discardedPartialFrameCount: UInt64(max(0, unattributedDiscardedPartialFrames))
+                eventCount: loss.discontinuityEvents,
+                missingFrameCount: loss.missingFrames,
+                discardedPartialFrameCount: loss.discardedPartialFrames
             ), onError: onError)
         }
-        unattributedDiscontinuityEvents = 0
-        unattributedMissingFrames = 0
-        unattributedDiscardedPartialFrames = 0
 
-        guard pendingDroppedIntervals > 0 else { return }
+        guard loss.droppedIntervals > 0 else { return }
         // `lastTimestamp` is the end of the last logged interval, which is
         // where the undelivered intervals begin.
         let startedAt = min(
             endedAt,
-            lastTimestamp ?? endedAt.addingTimeInterval(-Double(pendingDroppedIntervals))
+            lastTimestamp ?? endedAt.addingTimeInterval(-Double(loss.droppedIntervals))
         )
         logger.appendGap(MeasurementGap(
             sessionID: sessionID,
             startedAt: startedAt,
             endedAt: endedAt,
-            lostSecondIntervals: pendingDroppedIntervals,
+            lostSecondIntervals: loss.droppedIntervals,
             reason: "Completed-second buffer overflow"
         ), onError: onError)
-        pendingDroppedIntervals = 0
+    }
+
+    struct TrailingLoss: Equatable {
+        var discontinuityEvents: UInt64 = 0
+        var missingFrames: UInt64 = 0
+        var discardedPartialFrames: UInt64 = 0
+        var droppedIntervals: UInt64 = 0
+    }
+
+    /// What happened after the last interval taken from the queue. `tail`
+    /// must be read before the final drain, so every interval it counts was
+    /// either drained (and its attached events logged) or dropped.
+    static func trailingLoss(
+        tail: AudioStreamTail?,
+        lastTakenCompletedSecondCount: UInt64?
+    ) -> TrailingLoss {
+        guard let tail else { return TrailingLoss() }
+        var loss = TrailingLoss()
+        // Pending discontinuities belong to no drained interval only if no
+        // interval was delivered after the one taken last. Otherwise they were
+        // attached to a later interval, which already produced its gap row.
+        if lastTakenCompletedSecondCount == nil
+            || tail.lastDeliveredCompletedSecondCount == lastTakenCompletedSecondCount {
+            loss.discontinuityEvents = tail.pendingDiscontinuityEvents
+            loss.missingFrames = tail.pendingMissingFrames
+            loss.discardedPartialFrames = tail.pendingDiscardedPartialFrames
+        }
+        // Intervals completed after the last taken one were dropped; drops
+        // between taken intervals were already logged as sequence gaps.
+        if let lastTaken = lastTakenCompletedSecondCount,
+           tail.completedSecondCount > lastTaken {
+            loss.droppedIntervals = tail.completedSecondCount - lastTaken
+        }
+        return loss
     }
 
     private func calibrated(_ value: Double?) -> Double? {

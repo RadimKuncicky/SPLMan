@@ -43,6 +43,13 @@ enum LoggingIntegrityTests {
             logger.append(makeSample(sessionID: session.id, timestamp: 1_001, second: 10)) {
                 errors.append($0)
             }
+            logger.appendGap(MeasurementGap(
+                sessionID: session.id,
+                startedAt: Date(timeIntervalSince1970: 1_001),
+                endedAt: Date(timeIntervalSince1970: 1_002),
+                lostSecondIntervals: 1,
+                reason: "Completed-second buffer overflow"
+            )) { errors.append($0) }
             logger.append(makeSample(
                 sessionID: session.id,
                 timestamp: 1_003,
@@ -84,6 +91,9 @@ enum LoggingIntegrityTests {
             }
             if !contents.contains(",gap,") || !contents.contains(",1,,AudioDropout,") {
                 failures.append("A missing completed-second sample did not produce a gap row")
+            }
+            if contents.components(separatedBy: ",gap,").count - 1 != 1 {
+                failures.append("A missing completed-second sample was logged as more than one gap")
             }
             if !contents.contains(",Invalid,One or more mandatory metrics unavailable,12,576000,") {
                 failures.append("An invalid/silent second was not retained with its sequence")

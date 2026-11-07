@@ -117,7 +117,6 @@ final class CSVMeasurementLogger: @unchecked Sendable {
     private var errorReported = false
     private var writesSinceSynchronization = 0
     private var lastCompletedSecondCount: UInt64?
-    private var lastSampleTimestamp: Date?
 
     init(maximumPendingWrites: Int = 120, synchronizationInterval: Int = 1) {
         self.maximumPendingWrites = max(1, maximumPendingWrites)
@@ -170,7 +169,6 @@ final class CSVMeasurementLogger: @unchecked Sendable {
                 errorReported = false
                 writesSinceSynchronization = 0
                 lastCompletedSecondCount = nil
-                lastSampleTimestamp = nil
                 stateLock.lock()
                 if lifecycle == .starting { lifecycle = .acceptingWrites }
                 stateLock.unlock()
@@ -208,22 +206,12 @@ final class CSVMeasurementLogger: @unchecked Sendable {
                     ))
                     throw error
                 }
-                if sample.completedSecondCount > previous + 1 {
-                    let lost = sample.completedSecondCount - previous - 1
-                    let gapStart = lastSampleTimestamp?.addingTimeInterval(1)
-                        ?? sample.timestamp.addingTimeInterval(-Double(lost))
-                    try write(Self.gapLine(MeasurementGap(
-                        sessionID: session.id,
-                        startedAt: gapStart,
-                        endedAt: sample.timestamp,
-                        lostSecondIntervals: lost,
-                        reason: "Missing completed-second samples"
-                    ), sessionStatus: session.status))
-                }
+                // Sequence gaps are written by the producer via `appendGap`,
+                // which knows their cause and exact UTC bounds. Writing one
+                // here as well would count every lost interval twice.
             }
             try write(Self.sampleLine(sample, session: session))
             lastCompletedSecondCount = sample.completedSecondCount
-            lastSampleTimestamp = sample.timestamp
         }
     }
 
@@ -308,7 +296,6 @@ final class CSVMeasurementLogger: @unchecked Sendable {
             let closeResult = closeFile()
             activeSession = nil
             lastCompletedSecondCount = nil
-            lastSampleTimestamp = nil
             if firstError == nil, case let .failure(error) = closeResult { firstError = error }
             stateLock.lock()
             lifecycle = .closed
@@ -327,7 +314,10 @@ final class CSVMeasurementLogger: @unchecked Sendable {
     static func inspectSession(at url: URL) throws -> MeasurementSessionInspection? {
         let rows = parseCSV(try String(contentsOf: url, encoding: .utf8))
         guard let header = rows.first else { return nil }
-        let columns = Dictionary(uniqueKeysWithValues: header.enumerated().map { ($1, $0) })
+        let columns = Dictionary(
+            header.enumerated().map { ($1, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
         guard let sessionIndex = columns[headerFields[Column.sessionID.rawValue]],
               let statusIndex = columns[headerFields[Column.sessionStatus.rawValue]] else { return nil }
         let startedIndex = columns[headerFields[Column.sessionStartedAtUTC.rawValue]]

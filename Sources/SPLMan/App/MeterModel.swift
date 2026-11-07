@@ -35,6 +35,9 @@ final class MeterModel: ObservableObject {
     }
     @Published var alarmSettings: AlarmSettings {
         didSet {
+            // Text fields commit on blur and on closing Settings even when the
+            // value is unchanged; only real changes belong in the session log.
+            guard oldValue != alarmSettings else { return }
             historyStore.saveAlarmSettings(alarmSettings)
             secondRecorder?.updateConfiguration(
                 alarmSettings: alarmSettings,
@@ -136,7 +139,9 @@ final class MeterModel: ObservableObject {
     }
 
     var canReconfigureAnalysisInput: Bool {
-        !isRecording && !isPreparingRecording
+        // Changing the reference channel restarts the input, which would
+        // silently discard a calibration in progress.
+        !isRecording && !isPreparingRecording && calibrationSession == nil
     }
 
     var operationalStatus: MeterOperationalStatus {

@@ -41,6 +41,7 @@ enum SelfTest {
         testDisplayedAudioDropoutCount(&failures)
         testDiscontinuityGapTiming(&failures)
         testSequenceGapTiming(&failures)
+        testTrailingLossAccounting(&failures)
         testRollingEnergyPrecision(&failures)
         testSettingsKeepCalibrationsOnPartialDecodeFailure(&failures)
         testRecordingEventHistory(&failures)
@@ -481,6 +482,61 @@ enum SelfTest {
         if atStart.startedAt != Date(timeIntervalSince1970: 1_012.5)
             || atStart.startedAt > atStart.endedAt {
             failures.append("Recording-start sequence gap began before the session")
+        }
+    }
+
+    private static func testTrailingLossAccounting(_ failures: inout [String]) {
+        func tail(
+            lastDelivered: UInt64?,
+            completed: UInt64,
+            events: UInt64
+        ) -> AudioStreamTail {
+            AudioStreamTail(
+                lastDeliveredCompletedSecondCount: lastDelivered,
+                completedSecondCount: completed,
+                pendingDiscontinuityEvents: events,
+                pendingMissingFrames: events * 100,
+                pendingDiscardedPartialFrames: events * 10
+            )
+        }
+
+        let undelivered = CompletedSecondRecorder.trailingLoss(
+            tail: tail(lastDelivered: 20, completed: 20, events: 2),
+            lastTakenCompletedSecondCount: 20
+        )
+        if undelivered != CompletedSecondRecorder.TrailingLoss(
+            discontinuityEvents: 2,
+            missingFrames: 200,
+            discardedPartialFrames: 20,
+            droppedIntervals: 0
+        ) {
+            failures.append("Discontinuity after the last interval did not produce a trailing gap")
+        }
+
+        // A discontinuity attached to an interval delivered after the tail was
+        // read is logged with that interval and must not be repeated.
+        let attachedLater = CompletedSecondRecorder.trailingLoss(
+            tail: tail(lastDelivered: 20, completed: 20, events: 1),
+            lastTakenCompletedSecondCount: 21
+        )
+        if attachedLater != CompletedSecondRecorder.TrailingLoss() {
+            failures.append("Discontinuity attached to a drained interval was logged twice")
+        }
+
+        let dropped = CompletedSecondRecorder.trailingLoss(
+            tail: tail(lastDelivered: 20, completed: 23, events: 0),
+            lastTakenCompletedSecondCount: 20
+        )
+        if dropped.droppedIntervals != 3 || dropped.discontinuityEvents != 0 {
+            failures.append("Intervals dropped after the last drained one were not counted")
+        }
+
+        let staleTail = CompletedSecondRecorder.trailingLoss(
+            tail: tail(lastDelivered: 18, completed: 19, events: 0),
+            lastTakenCompletedSecondCount: 20
+        )
+        if staleTail.droppedIntervals != 0 {
+            failures.append("A stale stream tail produced phantom dropped intervals")
         }
     }
 

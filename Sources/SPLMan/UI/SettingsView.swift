@@ -542,7 +542,8 @@ private struct NumericTextField: View {
 
     private func commit() {
         if let parsedValue = parsed(draft), parsedValue.isFinite {
-            value = validation(parsedValue.rounded())
+            let committedValue = validation(parsedValue.rounded())
+            if committedValue != value { value = committedValue }
         }
         draft = formatted(value)
     }

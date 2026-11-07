@@ -370,6 +370,45 @@ private final class CompletedSecondQueue {
     }
 }
 
+/// State of the stream after the last interval handed to the consumer queue.
+/// A consumer that has drained the queue uses it to log what happened after
+/// its last interval without double-counting events attached to intervals.
+struct AudioStreamTail: Equatable {
+    /// Completed-second count of the last interval accepted by the queue.
+    let lastDeliveredCompletedSecondCount: UInt64?
+    /// Lifetime completed-second count of the DSP, delivered or dropped.
+    let completedSecondCount: UInt64
+    /// Discontinuities not yet attached to a delivered interval.
+    let pendingDiscontinuityEvents: UInt64
+    let pendingMissingFrames: UInt64
+    let pendingDiscardedPartialFrames: UInt64
+}
+
+/// Published at the end of every callback with `try()`. A missed publication
+/// leaves the value at most one callback old, never ahead of the queue.
+private final class AudioStreamTailBox {
+    private let lock = NSLock()
+    private var value: AudioStreamTail?
+
+    func publish(_ tail: AudioStreamTail) {
+        guard lock.try() else { return }
+        value = tail
+        lock.unlock()
+    }
+
+    func read() -> AudioStreamTail? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func clear() {
+        lock.lock()
+        value = nil
+        lock.unlock()
+    }
+}
+
 private final class AudioCaptureHealthBox {
     private let lock = NSLock()
     private var sampleRate: Double?
@@ -526,12 +565,14 @@ private final class AudioRenderContext {
     let completedSeconds: CompletedSecondQueue
     let health: AudioCaptureHealthBox
     let spectrogramSignalTap: SpectrogramSignalTap
+    let streamTail: AudioStreamTailBox
 
     // Audio-thread owned.
     private var expectedNextSampleTime: Float64?
     private var pendingDiscontinuityEvents: UInt64 = 0
     private var pendingMissingFrames: UInt64 = 0
     private var pendingDiscardedPartialFrames: UInt64 = 0
+    private var lastDeliveredCompletedSecondCount: UInt64?
 
     init(
         unit: AudioUnit,
@@ -541,7 +582,8 @@ private final class AudioRenderContext {
         latest: LatestSnapshotBox,
         completedSeconds: CompletedSecondQueue,
         health: AudioCaptureHealthBox,
-        spectrogramSignalTap: SpectrogramSignalTap
+        spectrogramSignalTap: SpectrogramSignalTap,
+        streamTail: AudioStreamTailBox
     ) {
         self.unit = unit
         self.processor = processor
@@ -551,6 +593,17 @@ private final class AudioRenderContext {
         self.completedSeconds = completedSeconds
         self.health = health
         self.spectrogramSignalTap = spectrogramSignalTap
+        self.streamTail = streamTail
+    }
+
+    private func publishStreamTail() {
+        streamTail.publish(AudioStreamTail(
+            lastDeliveredCompletedSecondCount: lastDeliveredCompletedSecondCount,
+            completedSecondCount: processor.currentCompletedSecondCount,
+            pendingDiscontinuityEvents: pendingDiscontinuityEvents,
+            pendingMissingFrames: pendingMissingFrames,
+            pendingDiscardedPartialFrames: pendingDiscardedPartialFrames
+        ))
     }
 
     func render(
@@ -624,8 +677,10 @@ private final class AudioRenderContext {
                 pendingDiscontinuityEvents = 0
                 pendingMissingFrames = 0
                 pendingDiscardedPartialFrames = 0
+                lastDeliveredCompletedSecondCount = snapshot.completedSecondCount
             }
         }
+        publishStreamTail()
         return noErr
     }
 
@@ -636,6 +691,7 @@ private final class AudioRenderContext {
         pendingDiscontinuityEvents &+= 1
         pendingDiscardedPartialFrames &+= discardedFrames
         expectedNextSampleTime = nil
+        publishStreamTail()
     }
 
     /// Returns the number of skipped frames when the sample time does not
@@ -668,6 +724,7 @@ final class AudioCaptureEngine {
     private let completedSeconds = CompletedSecondQueue()
     private let health = AudioCaptureHealthBox()
     private let spectrogramSignalTap = SpectrogramSignalTap()
+    private let streamTail = AudioStreamTailBox()
     private var audioUnit: AudioUnit?
     private var renderContext: Unmanaged<AudioRenderContext>?
     private var reportedClippedFrameCount: UInt64 = 0
@@ -773,7 +830,8 @@ final class AudioCaptureEngine {
                 latest: latest,
                 completedSeconds: completedSeconds,
                 health: health,
-                spectrogramSignalTap: spectrogramSignalTap
+                spectrogramSignalTap: spectrogramSignalTap,
+                streamTail: streamTail
             ))
             renderContext = context
             var callback = AURenderCallbackStruct(
@@ -786,6 +844,7 @@ final class AudioCaptureEngine {
             ), L10n.text("registrace audio callbacku"))
             try check(AudioUnitInitialize(unit), L10n.text("inicializace vstupu"))
             completedSeconds.clear()
+            streamTail.clear()
             health.configure(sampleRate: sampleRate)
             reportedClippedFrameCount = 0
             reportedDroppedSecondCount = 0
@@ -822,6 +881,12 @@ final class AudioCaptureEngine {
 
     func takeCompletedSecond() -> CompletedAudioSecond? {
         completedSeconds.take()
+    }
+
+    /// Read this before draining `takeCompletedSecond()`: every interval it
+    /// counts is then either drained or was dropped.
+    func currentStreamTail() -> AudioStreamTail? {
+        streamTail.read()
     }
 
     /// Returns event deltas plus cumulative frame count and current sample rate.

@@ -184,7 +184,12 @@ enum RecordingEventHistoryReader {
             for row in rows {
                 rowNumber += 1
                 guard let existingColumns = columns else {
-                    columns = Dictionary(uniqueKeysWithValues: row.enumerated().map { ($1, $0) })
+                    // A hand-edited file may repeat a header name; keep the
+                    // first occurrence instead of trapping.
+                    columns = Dictionary(
+                        row.enumerated().map { ($1, $0) },
+                        uniquingKeysWith: { first, _ in first }
+                    )
                     continue
                 }
                 guard let rowType = value("row_type", in: row, columns: existingColumns),
