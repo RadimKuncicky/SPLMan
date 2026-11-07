@@ -5,8 +5,13 @@ struct TransferFunctionDisplayState {
     // Three seconds spans several normal analysis blocks, hiding transient worker delays
     // without leaving a stalled result on screen indefinitely.
     static let maximumAnalysisSilenceDuration: TimeInterval = 3
+    // An analysis block lasts ~0.34–0.37 s, so a one-second hold alone is shorter
+    // than two failed blocks plus delivery jitter. Only a sustained run of invalid
+    // blocks clears the curve; shorter runs stay bounded by the silence limit.
+    static let invalidAnalysesBeforeExpiry = 3
 
     private var retainedCurve: TransferFunctionCurve?
+    private var consecutiveInvalidAnalyses = 0
     private var retentionDeadline: TimeInterval?
     private var currentInvalidity: TransferFunctionValidity = .waitingForSignal
     private var lastValidAnalysisUptime: TimeInterval?
@@ -27,13 +32,19 @@ struct TransferFunctionDisplayState {
             lastValidAnalysisUptime = uptime
             lastInputActivityUptime = nil
             acceptsInputActivity = true
+            consecutiveInvalidAnalyses = 0
             return analysis
         }
 
         currentInvalidity = analysis.validity
         acceptsInputActivity = false
+        consecutiveInvalidAnalyses += 1
         if let lastValidAnalysisUptime {
-            retentionDeadline = lastValidAnalysisUptime + Self.curveRetentionDuration
+            retentionDeadline = lastValidAnalysisUptime + (
+                consecutiveInvalidAnalyses >= Self.invalidAnalysesBeforeExpiry
+                    ? Self.curveRetentionDuration
+                    : Self.maximumAnalysisSilenceDuration
+            )
         }
         guard let retainedCurve,
               let retentionDeadline,
@@ -100,5 +111,6 @@ struct TransferFunctionDisplayState {
         lastValidAnalysisUptime = nil
         lastInputActivityUptime = nil
         acceptsInputActivity = false
+        consecutiveInvalidAnalyses = 0
     }
 }

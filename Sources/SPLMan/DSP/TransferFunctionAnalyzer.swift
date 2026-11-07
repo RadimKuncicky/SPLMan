@@ -596,7 +596,9 @@ final class TransferFunctionAnalyzer: @unchecked Sendable {
                 )) / Double(max(1, latestFrame.measurement.count))
             ))
         )
-        let pendingLimit = min(Self.maximumPendingFrameCount, framesPerBlock)
+        // Two blocks of backlog: a single main-thread hiccup that delivers a
+        // few frames at once must not discard the partially assembled block.
+        let pendingLimit = min(Self.maximumPendingFrameCount, max(4, 2 * framesPerBlock))
         if pendingFrames.count > pendingLimit {
             pendingFrames.removeFirst(
                 pendingFrames.count - pendingLimit

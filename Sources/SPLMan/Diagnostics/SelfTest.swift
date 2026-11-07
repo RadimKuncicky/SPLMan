@@ -2066,13 +2066,17 @@ enum SelfTest {
         if briefDropout.validity != .invalidReference
             || briefDropout.curve != firstCurve
             || repeatedDropout.curve != firstCurve
-            || displayState.expire(at: 10.99) != nil {
+            || displayState.expire(at: 10.99) != nil
+            || displayState.expire(at: 11.1) != nil {
             failures.append("Transfer function display did not retain a curve through a brief dropout")
         }
-        let expiredDropout = displayState.expire(at: 11)
-        if expiredDropout?.validity != .invalidReference
-            || expiredDropout?.curve != nil
-            || displayState.expire(at: 11.1) != nil {
+        let expiredDropout = displayState.update(
+            with: TransferFunctionAnalysis(validity: .invalidReference, curve: nil),
+            at: 11.15
+        )
+        if expiredDropout.validity != .invalidReference
+            || expiredDropout.curve != nil
+            || displayState.expire(at: 11.18) != nil {
             failures.append("Transfer function display did not expire a sustained dropout")
         }
         let afterExpiredDropout = displayState.update(
@@ -2161,6 +2165,12 @@ enum SelfTest {
             at: 50.9
         )
         invalidReferenceDisplayState.noteInputActivity(capturedAtUptime: 51.2)
+        for uptime in [50.93, 50.96] {
+            _ = invalidReferenceDisplayState.update(
+                with: TransferFunctionAnalysis(validity: .invalidReference, curve: nil),
+                at: uptime
+            )
+        }
         let invalidReferenceExpiration = invalidReferenceDisplayState.expire(at: 51)
         if invalidReference.curve != firstCurve
             || invalidReferenceExpiration?.validity != .invalidReference

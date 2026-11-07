@@ -51,6 +51,18 @@ private final class SpectrogramSignalTap {
         count: SpectrogramAnalyzer.maximumFrameCount * queueCapacity
     )
     private var queuedStartHostTimes = [UInt64](repeating: 0, count: queueCapacity)
+    // Consumer-owned staging, so `takeAll` only copies while holding `lock`
+    // and the audio callback's `try()` is not blocked by allocations.
+    private let consumerLock = NSLock()
+    private var stagedFrames = [Float](
+        repeating: 0,
+        count: SpectrogramAnalyzer.maximumFrameCount * queueCapacity
+    )
+    private var stagedReferenceFrames = [Float](
+        repeating: 0,
+        count: SpectrogramAnalyzer.maximumFrameCount * queueCapacity
+    )
+    private var stagedStartHostTimes = [UInt64](repeating: 0, count: queueCapacity)
     private var frameCapacity = 0
     private var accumulatedCount = 0
     private var accumulationStartHostTime: UInt64 = 0
@@ -164,46 +176,59 @@ private final class SpectrogramSignalTap {
     }
 
     func takeAll() -> [AudioAnalysisSignalFrame] {
+        consumerLock.lock()
+        defer { consumerLock.unlock() }
+
+        // Phase 1: memcpy only, no allocation, while the producer is locked out.
         lock.lock()
-        defer { lock.unlock() }
-        guard queuedCount > 0, let sampleRate else { return [] }
-        var frames: [AudioAnalysisSignalFrame] = []
-        frames.reserveCapacity(queuedCount)
-        while queuedCount > 0 {
-            var samples = [Float](repeating: 0, count: frameCapacity)
-            var referenceSamples: [Float]?
-            let sourceOffset = readIndex * SpectrogramAnalyzer.maximumFrameCount
-            samples.withUnsafeMutableBufferPointer { destination in
+        guard queuedCount > 0, let sampleRate else {
+            lock.unlock()
+            return []
+        }
+        let frameCount = queuedCount
+        let samplesPerFrame = frameCapacity
+        let hasReference = capturesReference
+        let frameStride = SpectrogramAnalyzer.maximumFrameCount
+        for slot in 0..<frameCount {
+            let sourceOffset = readIndex * frameStride
+            let destinationOffset = slot * frameStride
+            stagedFrames.withUnsafeMutableBufferPointer { destination in
                 queuedFrames.withUnsafeBufferPointer { source in
-                    destination.baseAddress?.update(
+                    destination.baseAddress!.advanced(by: destinationOffset).update(
                         from: source.baseAddress!.advanced(by: sourceOffset),
-                        count: frameCapacity
+                        count: samplesPerFrame
                     )
                 }
             }
-            if capturesReference {
-                var reference = [Float](repeating: 0, count: frameCapacity)
-                reference.withUnsafeMutableBufferPointer { destination in
+            if hasReference {
+                stagedReferenceFrames.withUnsafeMutableBufferPointer { destination in
                     queuedReferenceFrames.withUnsafeBufferPointer { source in
-                        destination.baseAddress?.update(
+                        destination.baseAddress!.advanced(by: destinationOffset).update(
                             from: source.baseAddress!.advanced(by: sourceOffset),
-                            count: frameCapacity
+                            count: samplesPerFrame
                         )
                     }
                 }
-                referenceSamples = reference
             }
-            let capturedAtUptime = Double(
-                AudioConvertHostTimeToNanos(queuedStartHostTimes[readIndex])
-            ) / 1_000_000_000
-            frames.append(AudioAnalysisSignalFrame(
-                samples: samples,
-                referenceSamples: referenceSamples,
-                sampleRate: sampleRate,
-                capturedAtUptime: capturedAtUptime
-            ))
+            stagedStartHostTimes[slot] = queuedStartHostTimes[readIndex]
             readIndex = (readIndex + 1) % Self.queueCapacity
             queuedCount -= 1
+        }
+        lock.unlock()
+
+        // Phase 2: build the output arrays without blocking the audio callback.
+        var frames: [AudioAnalysisSignalFrame] = []
+        frames.reserveCapacity(frameCount)
+        for slot in 0..<frameCount {
+            let range = (slot * frameStride)..<(slot * frameStride + samplesPerFrame)
+            frames.append(AudioAnalysisSignalFrame(
+                samples: Array(stagedFrames[range]),
+                referenceSamples: hasReference ? Array(stagedReferenceFrames[range]) : nil,
+                sampleRate: sampleRate,
+                capturedAtUptime: Double(
+                    AudioConvertHostTimeToNanos(stagedStartHostTimes[slot])
+                ) / 1_000_000_000
+            ))
         }
         return frames
     }
