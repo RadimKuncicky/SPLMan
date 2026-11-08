@@ -9,6 +9,12 @@ history.
 
 ![SPL Man application](docs/screenshot.jpg)
 
+## Download
+
+Download [SPL Man for Apple silicon](dist/SPLMan-macOS-arm64.zip), extract the
+archive, and move `SPLMan.app` to Applications. The build requires macOS 13 or
+later and is ad hoc signed but not notarized.
+
 ## Build
 
 Requires macOS 13 or later and Swift 6:
