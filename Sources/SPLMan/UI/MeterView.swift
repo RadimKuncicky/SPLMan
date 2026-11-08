@@ -139,8 +139,12 @@ private struct TransferFunctionView: View {
                     )
                 )
                 var referencePath = Path()
-                for referenceOffsetDB in [-6.0, 0, 6.0]
-                where (-displayHalfRangeDB...displayHalfRangeDB).contains(referenceOffsetDB) {
+                let referenceStepDB = 6.0
+                let referenceLineCount = Int(
+                    (displayHalfRangeDB / referenceStepDB).rounded(.down)
+                )
+                for referenceIndex in -referenceLineCount...referenceLineCount {
+                    let referenceOffsetDB = Double(referenceIndex) * referenceStepDB
                     let referenceLevelDB = displayCenterDB + referenceOffsetDB
                     let y = graphHeight * CGFloat(
                         (displayUpperDB - referenceLevelDB) / levelSpan
