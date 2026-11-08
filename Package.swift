@@ -9,15 +9,21 @@ let package = Package(
         .executable(name: "SPLMan", targets: ["SPLMan"])
     ],
     targets: [
+        .target(name: "ConsoleSockets"),
         .target(
             name: "WingKit",
+            dependencies: ["ConsoleSockets"],
             linkerSettings: [
                 .linkedFramework("Network")
             ]
         ),
+        .target(
+            name: "X32Kit",
+            dependencies: ["ConsoleSockets"]
+        ),
         .executableTarget(
             name: "SPLMan",
-            dependencies: ["WingKit"],
+            dependencies: ["WingKit", "X32Kit"],
             resources: [.process("Resources")],
             linkerSettings: [
                 .linkedFramework("AppKit"),

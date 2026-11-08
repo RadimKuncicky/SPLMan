@@ -90,9 +90,9 @@ and is averaged over 5 seconds.
 ## Mixing console meter bridge
 
 SPL Man can show the level meters of a mixing console behind the measurements.
-Behringer WING consoles are supported through the small built-in `WingKit`
-library; the application is structured so that other consoles can be added as
-further drivers.
+Behringer WING consoles and Behringer X32 / Midas M32 consoles are supported
+through the small built-in `WingKit` and `X32Kit` libraries; the application is
+structured so that other consoles can be added as further drivers.
 
 Under **Mixing console** in Settings, select the console type. Leave the address
 empty to find the console on the network automatically, or enter its IP address
@@ -105,12 +105,14 @@ available or the connection is lost, it retries about every 5 seconds without
 showing any messages; the current state is shown in Settings. On first use,
 macOS asks for permission to access the local network.
 
-Channels, aux, buses, mains, matrices, DCAs, inputs, and outputs are shown as
-separate sections, which can be switched on or off in Settings. Of the physical
-inputs and outputs, only the console's local connectors are shown by default.
-Strips have a left and a right bar, because every WING strip can be stereo. The
-sections wrap into two rows when one row would make the bars too narrow. Bars are
-green below -18 dB, yellow from -18 dB, and red from 0 dB.
+Each part of the console, such as channels, aux, buses, mains, matrices, inputs,
+and outputs, is shown as a separate section, and sections can be switched on or
+off in Settings. On a WING, DCAs are available as well, and of the physical inputs
+and outputs only the local connectors are shown by default. WING strips have a
+left and a right bar, because every WING strip can be stereo; X32 strips have one
+bar, except main LR and the effect returns. The sections wrap into two rows when
+one row would make the bars too narrow. Bars are green below -18 dB, yellow from
+-18 dB, and red from 0 dB.
 
 ## Recording, sessions, and history
 

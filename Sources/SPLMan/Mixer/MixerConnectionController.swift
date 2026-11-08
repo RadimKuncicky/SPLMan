@@ -20,7 +20,8 @@ final class MixerConnectionController {
         var retryDelay: TimeInterval = 5
         /// Covers discovery, which takes up to 5 s, and a slow connection.
         var attemptTimeout: TimeInterval = 20
-        /// Metering is renewed every 3 s, so 5 s of silence means a lost console.
+        /// Consoles send meters many times per second and drivers renew them well
+        /// before they expire, so 5 s of silence means a lost console.
         var meterDataTimeout: TimeInterval = 5
         /// Bars must not stay frozen at the last level while the data is missing.
         var staleLevelsAfter: TimeInterval = 1

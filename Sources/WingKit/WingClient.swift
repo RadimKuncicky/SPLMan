@@ -1,4 +1,4 @@
-import Darwin
+import ConsoleSockets
 import Foundation
 import Network
 
@@ -32,7 +32,6 @@ public final class WingClient {
     /// Requesting names regularly also keeps linked names current.
     private static let renewalsPerNameRefresh = 10
     private static let connectionTimeoutSeconds = 5
-    private static let receiveBufferBytes: Int32 = 256 * 1_024
 
     private let queue = DispatchQueue(label: "cz.splman.wingkit", qos: .userInitiated)
     private let meterGroups: [[WingMeter]]
@@ -47,9 +46,7 @@ public final class WingClient {
     private var names: [Int32: String] = [:]
     private var namesRevision = 0
 
-    private var socketDescriptor: Int32 = -1
-    private var meterPort: UInt16 = 0
-    private var socketSource: DispatchSourceRead?
+    private var socket: ConsoleUDPSocket?
     private var connection: NWConnection?
     private var parser = WingStreamParser()
     private var discoveryTimer: DispatchSourceTimer?
@@ -100,16 +97,18 @@ public final class WingClient {
     // MARK: - Session
 
     private func begin() {
-        guard state == .connecting, connection == nil, socketSource == nil else { return }
-        guard openSocket() else {
+        guard state == .connecting, connection == nil, socket == nil else { return }
+        socket = ConsoleUDPSocket(queue: queue) { [weak self] datagram, _ in
+            self?.handleDatagram(datagram)
+        }
+        guard let socket else {
             fail()
             return
         }
         if let address {
             // The reply only names the console; the connection does not wait for it.
-            var destination = in_addr()
-            if inet_pton(AF_INET, address, &destination) == 1 {
-                sendDatagram(WingProtocol.discoveryRequest, to: destination)
+            if let destination = ConsoleUDPSocket.ipv4Address(address) {
+                socket.send(WingProtocol.discoveryRequest, to: destination, port: WingProtocol.port)
             }
             openConnection(to: address)
         } else {
@@ -134,9 +133,8 @@ public final class WingClient {
         connection?.stateUpdateHandler = nil
         connection?.cancel()
         connection = nil
-        socketSource?.cancel()
-        socketSource = nil
-        socketDescriptor = -1
+        socket?.close()
+        socket = nil
     }
 
     private func makeTimer(
@@ -152,50 +150,6 @@ public final class WingClient {
 
     // MARK: - UDP
 
-    private func openSocket() -> Bool {
-        let descriptor = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
-        guard descriptor >= 0 else { return false }
-
-        var enabled: Int32 = 1
-        var bufferBytes = Self.receiveBufferBytes
-        let optionSize = socklen_t(MemoryLayout<Int32>.size)
-        setsockopt(descriptor, SOL_SOCKET, SO_BROADCAST, &enabled, optionSize)
-        setsockopt(descriptor, SOL_SOCKET, SO_RCVBUF, &bufferBytes, optionSize)
-
-        var local = sockaddr_in()
-        local.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        local.sin_family = sa_family_t(AF_INET)
-        local.sin_port = 0
-        local.sin_addr = in_addr(s_addr: 0)
-        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
-        let isBound = withUnsafeMutablePointer(to: &local) { pointer -> Bool in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { address -> Bool in
-                guard Darwin.bind(descriptor, address, length) == 0 else { return false }
-                return getsockname(descriptor, address, &length) == 0
-            }
-        }
-        let flags = fcntl(descriptor, F_GETFL, 0)
-        guard isBound, flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
-            Darwin.close(descriptor)
-            return false
-        }
-        meterPort = UInt16(bigEndian: local.sin_port)
-        socketDescriptor = descriptor
-
-        let source = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: queue)
-        source.setEventHandler { [weak self] in
-            self?.readDatagrams()
-        }
-        source.setCancelHandler {
-            Darwin.close(descriptor)
-        }
-        source.resume()
-        socketSource = source
-        return true
-    }
-
-    /// A Mac on Wi-Fi and Ethernet routes 255.255.255.255 through one of them, so
-    /// the request also goes to the broadcast address of every network.
     private func sendDiscovery() {
         guard connection == nil else {
             discoveryTimer?.cancel()
@@ -207,67 +161,7 @@ public final class WingClient {
             return
         }
         discoveriesSent += 1
-        sendDatagram(WingProtocol.discoveryRequest, to: in_addr(s_addr: UInt32.max))
-        for destination in Self.interfaceBroadcastAddresses() {
-            sendDatagram(WingProtocol.discoveryRequest, to: destination)
-        }
-    }
-
-    private static func interfaceBroadcastAddresses() -> [in_addr] {
-        var first: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&first) == 0, let start = first else { return [] }
-        defer { freeifaddrs(start) }
-
-        var addresses: [in_addr] = []
-        for interface in sequence(first: start, next: { $0.pointee.ifa_next }) {
-            let flags = Int32(bitPattern: interface.pointee.ifa_flags)
-            guard flags & IFF_UP != 0,
-                  flags & IFF_BROADCAST != 0,
-                  flags & IFF_LOOPBACK == 0,
-                  let address = interface.pointee.ifa_addr,
-                  address.pointee.sa_family == sa_family_t(AF_INET),
-                  let broadcast = interface.pointee.ifa_dstaddr else { continue }
-            addresses.append(UnsafeRawPointer(broadcast).load(as: sockaddr_in.self).sin_addr)
-        }
-        return addresses
-    }
-
-    private func sendDatagram(_ bytes: [UInt8], to destination: in_addr) {
-        guard socketDescriptor >= 0 else { return }
-        let descriptor = socketDescriptor
-        var remote = sockaddr_in()
-        remote.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        remote.sin_family = sa_family_t(AF_INET)
-        remote.sin_port = WingProtocol.port.bigEndian
-        remote.sin_addr = destination
-        // A refused send is not final: local network access may still be pending,
-        // and discovery repeats while the connection attempt runs.
-        _ = bytes.withUnsafeBytes { buffer in
-            withUnsafePointer(to: &remote) { pointer in
-                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { address in
-                    sendto(
-                        descriptor,
-                        buffer.baseAddress,
-                        buffer.count,
-                        0,
-                        address,
-                        socklen_t(MemoryLayout<sockaddr_in>.size)
-                    )
-                }
-            }
-        }
-    }
-
-    private func readDatagrams() {
-        let descriptor = socketDescriptor
-        guard descriptor >= 0 else { return }
-        let capacity = 8_192
-        var buffer = [UInt8](repeating: 0, count: capacity)
-        while true {
-            let count = recv(descriptor, &buffer, capacity, 0)
-            guard count > 0 else { return }
-            handleDatagram(Array(buffer[0..<count]))
-        }
+        socket?.broadcast(WingProtocol.discoveryRequest, port: WingProtocol.port)
     }
 
     private func handleDatagram(_ datagram: [UInt8]) {
@@ -327,6 +221,10 @@ public final class WingClient {
     }
 
     private func subscribe() {
+        guard let meterPort = socket?.port else {
+            fail()
+            return
+        }
         var message = WingProtocol.selectControlChannel + WingProtocol.meterPort(meterPort)
         for (index, meters) in meterGroups.enumerated() {
             message += WingProtocol.meterRequest(reportID: UInt32(index + 1), meters: meters)

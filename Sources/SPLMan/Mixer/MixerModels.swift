@@ -5,6 +5,7 @@ import Foundation
 enum MixerKind: String, CaseIterable, Codable, Identifiable {
     case none
     case behringerWing
+    case behringerX32
 
     var id: String { rawValue }
 
@@ -12,6 +13,7 @@ enum MixerKind: String, CaseIterable, Codable, Identifiable {
         switch self {
         case .none: L10n.text("Žádný")
         case .behringerWing: "Behringer WING"
+        case .behringerX32: "Behringer X32 / Midas M32"
         }
     }
 
@@ -19,6 +21,7 @@ enum MixerKind: String, CaseIterable, Codable, Identifiable {
         switch self {
         case .none: []
         case .behringerWing: WingMixerDriver.definitions.map(\.descriptor)
+        case .behringerX32: X32MixerDriver.definitions.map(\.descriptor)
         }
     }
 
@@ -26,6 +29,7 @@ enum MixerKind: String, CaseIterable, Codable, Identifiable {
         switch self {
         case .none: nil
         case .behringerWing: WingMixerDriver()
+        case .behringerX32: X32MixerDriver()
         }
     }
 }

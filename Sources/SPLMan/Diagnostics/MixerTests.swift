@@ -1,6 +1,7 @@
 import CoreGraphics
 import Foundation
 import WingKit
+import X32Kit
 
 enum MixerTests {
     private final class FakeDriver: MixerDriver {
@@ -24,6 +25,8 @@ enum MixerTests {
         testWingRequests(&failures)
         testWingReplies(&failures)
         testWingStream(&failures)
+        testX32Protocol(&failures)
+        testX32Definitions(&failures)
         testLayout(&failures)
         testSettings(&failures)
         testConnection(&failures)
@@ -180,6 +183,110 @@ enum MixerTests {
         }
         if texts([0xd5, 0x00, 0x00, 0x00, 0x00, 0x01, 0x40, 0xde, 0x80, 0x5a]) != ["Z"] {
             failures.append("WING values without text were not skipped")
+        }
+    }
+
+    private static func bytes(hex: String) -> [UInt8] {
+        stride(from: 0, to: hex.count, by: 2).compactMap { offset in
+            let start = hex.index(hex.startIndex, offsetBy: offset)
+            return UInt8(hex[start..<hex.index(start, offsetBy: 2)], radix: 16)
+        }
+    }
+
+    /// Hexadecimal examples are from "Unofficial X32/M32 OSC Remote Protocol".
+    private static func testX32Protocol(_ failures: inout [String]) {
+        if X32Protocol.infoRequest != Array("/info\0\0\0,\0\0\0".utf8) {
+            failures.append("X32 info request differs from the protocol example")
+        }
+        if X32Protocol.meterRequest(page: 6) != Array("/meters\0,s\0\0/meters/6\0\0\0".utf8) {
+            failures.append("X32 meter request is not padded as OSC requires")
+        }
+        if X32Protocol.read("/ch/01/config/name") != Array("/ch/01/config/name\0\0,\0\0\0".utf8) {
+            failures.append("X32 parameter read must not carry a value")
+        }
+
+        let reply = bytes(hex: "2f6d65746572732f360000002c6200000000001404000000fd1d2137fdff7f3f0000803f6ebbd534")
+        guard let meters = X32Message(packet: reply),
+              case .blob(let blob)? = meters.arguments.first,
+              let values = X32Protocol.meterValues(blob: blob) else {
+            failures.append("X32 meter reply from the protocol example was not read")
+            return
+        }
+        if X32Protocol.meterPage(address: meters.address) != 6 || values.count != 4 || values[2] != 1 {
+            failures.append("X32 meter reply values were read incorrectly")
+        }
+        if X32Protocol.meterValues(blob: [5, 0, 0, 0, 0, 0, 0, 0]) != nil {
+            failures.append("X32 meter blob with too few values was accepted")
+        }
+        if X32Protocol.meterPage(address: "/ch/01/config/name") != nil {
+            failures.append("X32 parameter address was taken for a meter page")
+        }
+
+        let infoReply = "/info\0\0\0,ssss\0\0\0V2.05\0\0\0osc-server\0\0X32\0" + "2.12\0\0\0\0"
+        let info = X32Message(packet: Array(infoReply.utf8))
+        let expected: [X32Message.Argument] = [
+            .string("V2.05"), .string("osc-server"), .string("X32"), .string("2.12")
+        ]
+        if info?.address != "/info" || info?.arguments != expected {
+            failures.append("X32 info reply from the protocol example was not read")
+        }
+
+        let name = X32Message(packet: Array("/ch/01/config/name\0\0,s\0\0Kick\0\0\0\0".utf8))
+        if name?.arguments != [X32Message.Argument.string("Kick")] {
+            failures.append("X32 parameter reply was not read")
+        }
+        if X32Message(packet: [0x2f, 0x61]) != nil
+            || X32Message(packet: Array("/a\0\0,b\0\0".utf8) + [0, 0, 0, 9, 1]) != nil {
+            failures.append("A truncated X32 message was accepted")
+        }
+    }
+
+    private static func testX32Definitions(_ failures: inout [String]) {
+        let definitions = X32MixerDriver.definitions
+        let pageSizes = [0: 70, 2: 49, 3: 22, 4: 82]
+        for definition in definitions {
+            guard let size = pageSizes[definition.page] else {
+                failures.append("X32 section \(definition.descriptor.id) uses an unknown meter page")
+                continue
+            }
+            let page = [Float](repeating: 1, count: size)
+            if definition.levels(from: page) == nil {
+                failures.append("X32 section \(definition.descriptor.id) exceeds its meter page")
+            }
+            if !definition.nameAddresses.isEmpty,
+               definition.nameAddresses.count != definition.descriptor.stripCount {
+                failures.append("X32 section \(definition.descriptor.id) has a wrong name count")
+            }
+        }
+        let identifiers = definitions.map(\.descriptor.id)
+        if Set(identifiers).count != identifiers.count {
+            failures.append("X32 meter sections do not have unique identifiers")
+        }
+        guard let channels = definitions.first(where: { $0.descriptor.id == "ch" }),
+              let main = definitions.first(where: { $0.descriptor.id == "main" }),
+              let effects = definitions.first(where: { $0.descriptor.id == "fxrtn" }) else {
+            failures.append("X32 channel, main or effect section is missing")
+            return
+        }
+        if channels.descriptor.barsPerStrip != 1
+            || main.descriptor.barsPerStrip != 2
+            || effects.nameAddresses.last != "/fxrtn/07/config/name"
+            || channels.nameAddresses.first != "/ch/01/config/name" {
+            failures.append("X32 strip layout or name addresses changed")
+        }
+
+        var page = [Float](repeating: 0, count: 70)
+        page[0] = 1
+        page[1] = 8
+        guard let levels = channels.levels(from: page), levels.count == 32 else {
+            failures.append("X32 channel levels were not read")
+            return
+        }
+        if levels[0] != 0 || abs(levels[1] - 18.06) > 0.01 || levels[2] != -Float.infinity {
+            failures.append("X32 linear meter values were not converted to dB")
+        }
+        if channels.levels(from: [1, 2, 3]) != nil {
+            failures.append("A short X32 meter page was accepted")
         }
     }
 
