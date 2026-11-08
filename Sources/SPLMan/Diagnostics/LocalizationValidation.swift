@@ -44,6 +44,9 @@ enum LocalizationValidation {
                 failures.append("\(localization) microphone permission text could not be loaded")
                 continue
             }
+            if (info["NSLocalNetworkUsageDescription"] ?? "").isEmpty {
+                failures.append("\(localization) local network permission text could not be loaded")
+            }
             let missingKeys = Set(english.keys).subtracting(localized.keys)
             let extraKeys = Set(localized.keys).subtracting(english.keys)
             if !missingKeys.isEmpty {

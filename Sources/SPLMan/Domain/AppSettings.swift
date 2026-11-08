@@ -122,6 +122,7 @@ enum AnalysisDisplayMode: String, CaseIterable, Codable, Identifiable {
     case spectrogram
     case transferFunction
     case combined
+    case meterBridge
     case none
 
     var id: String { rawValue }
@@ -131,8 +132,13 @@ enum AnalysisDisplayMode: String, CaseIterable, Codable, Identifiable {
         case .spectrogram: L10n.text("Spektrogram")
         case .transferFunction: L10n.text("Přenosová charakteristika")
         case .combined: L10n.text("Přenosová charakteristika a spektrogram")
+        case .meterBridge: L10n.text("Meter bridge")
         case .none: L10n.text("Nic")
         }
+    }
+
+    var usesAudioAnalysis: Bool {
+        showsSpectrogram || showsTransferFunction
     }
 
     var showsSpectrogram: Bool {
@@ -147,7 +153,8 @@ enum AnalysisDisplayMode: String, CaseIterable, Codable, Identifiable {
         switch self {
         case .spectrogram: .transferFunction
         case .transferFunction: .combined
-        case .combined: .none
+        case .combined: .meterBridge
+        case .meterBridge: .none
         case .none: .spectrogram
         }
     }
@@ -316,6 +323,7 @@ struct PersistedSettings: Codable, Equatable {
     var calibrations: [CalibrationKey: CalibrationRecord] = [:]
     var thresholds = VisualThresholds()
     var spectrogram = SpectrogramSettings()
+    var mixer = MixerSettings()
 
     private enum CodingKeys: String, CodingKey {
         case input
@@ -323,6 +331,7 @@ struct PersistedSettings: Codable, Equatable {
         case calibrations
         case thresholds
         case spectrogram
+        case mixer
     }
 
     init() {}
@@ -343,6 +352,8 @@ struct PersistedSettings: Codable, Equatable {
             ?? VisualThresholds()
         spectrogram = (try? container.decodeIfPresent(SpectrogramSettings.self, forKey: .spectrogram))
             ?? SpectrogramSettings()
+        mixer = (try? container.decodeIfPresent(MixerSettings.self, forKey: .mixer))
+            ?? MixerSettings()
     }
 }
 

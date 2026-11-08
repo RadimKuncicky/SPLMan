@@ -56,8 +56,8 @@ is not shown for it.
 ## Analysis
 
 The analysis section of Settings selects what is displayed: the spectrogram, the
-transfer function, both, or nothing (the default). Neither view affects the
-measured values.
+transfer function, both, the meter bridge of a connected mixing console, or
+nothing (the default). None of these views affects the measured values.
 
 ### Spectrogram
 
@@ -86,6 +86,31 @@ and is averaged over 5 seconds.
   reference lines every 6 dB
 - Coherence: the trace fades out where coherence drops below 0.8, reaching its
   minimum at 0.3, so unreliable parts of the curve are easy to recognize
+
+## Mixing console meter bridge
+
+SPL Man can show the level meters of a mixing console behind the measurements.
+Behringer WING consoles are supported through the small built-in `WingKit`
+library; the application is structured so that other consoles can be added as
+further drivers.
+
+Under **Mixing console** in Settings, select the console type. Leave the address
+empty to find the console on the network automatically, or enter its IP address
+if it is on another network or automatic discovery does not find it. Then select
+**Meter bridge** in the analysis section or with the analysis button on the
+display. The console connection only reads data and never changes the console.
+
+Once configured, SPL Man connects by itself at launch. If the console is not
+available or the connection is lost, it retries about every 5 seconds without
+showing any messages; the current state is shown in Settings. On first use,
+macOS asks for permission to access the local network.
+
+Channels, aux, buses, mains, matrices, DCAs, inputs, and outputs are shown as
+separate sections, which can be switched on or off in Settings. Of the physical
+inputs and outputs, only the console's local connectors are shown by default.
+Strips have a left and a right bar, because every WING strip can be stereo. The
+sections wrap into two rows when one row would make the bars too narrow. Bars are
+green below -18 dB, yellow from -18 dB, and red from 0 dB.
 
 ## Recording, sessions, and history
 

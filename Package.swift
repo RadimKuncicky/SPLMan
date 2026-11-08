@@ -9,8 +9,15 @@ let package = Package(
         .executable(name: "SPLMan", targets: ["SPLMan"])
     ],
     targets: [
+        .target(
+            name: "WingKit",
+            linkerSettings: [
+                .linkedFramework("Network")
+            ]
+        ),
         .executableTarget(
             name: "SPLMan",
+            dependencies: ["WingKit"],
             resources: [.process("Resources")],
             linkerSettings: [
                 .linkedFramework("AppKit"),

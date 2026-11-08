@@ -55,8 +55,13 @@ final class MeterModel: ObservableObject {
                     displayedMetrics: settings.displayedMetrics
                 )
             }
+            if oldValue.mixer != settings.mixer {
+                mixerBridge.apply(settings.mixer)
+            }
             if oldValue.spectrogram.displayMode != settings.spectrogram.displayMode {
-                engine.setSpectrogramCaptureEnabled(settings.spectrogram.displayMode != .none)
+                engine.setSpectrogramCaptureEnabled(
+                    settings.spectrogram.displayMode.usesAudioAnalysis
+                )
                 clearSpectrogramHistory()
             } else if oldValue.spectrogram.frequencyRange
                 != settings.spectrogram.frequencyRange {
@@ -72,6 +77,8 @@ final class MeterModel: ObservableObject {
             }
         }
     }
+
+    let mixerBridge: MixerBridgeModel
 
     private let store: SettingsStore
     private let recordingErrorStore: RecordingErrorStore
@@ -97,6 +104,7 @@ final class MeterModel: ObservableObject {
 
     init(store: SettingsStore = SettingsStore()) {
         self.store = store
+        mixerBridge = MixerBridgeModel()
         recordingErrorStore = RecordingErrorStore()
         historyStore = RecordingHistoryStore()
         settings = store.load()
@@ -104,7 +112,11 @@ final class MeterModel: ObservableObject {
         recordingMetadata = historyStore.loadMetadata()
         alarmSettings = historyStore.loadAlarmSettings()
         recordingHistory = historyStore.loadHistory()
-        engine.setSpectrogramCaptureEnabled(settings.spectrogram.displayMode != .none)
+        if settings.spectrogram.displayMode == .meterBridge, settings.mixer.kind == .none {
+            settings.spectrogram.displayMode = .none
+        }
+        engine.setSpectrogramCaptureEnabled(settings.spectrogram.displayMode.usesAudioAnalysis)
+        mixerBridge.apply(settings.mixer)
         refreshDevices()
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.consumeAudioSnapshot() }
@@ -210,7 +222,37 @@ final class MeterModel: ObservableObject {
     }
 
     func cycleAnalysisDisplayMode() {
-        setAnalysisDisplayMode(settings.spectrogram.displayMode.next)
+        var mode = settings.spectrogram.displayMode.next
+        if !availableAnalysisDisplayModes.contains(mode) {
+            mode = mode.next
+        }
+        setAnalysisDisplayMode(mode)
+    }
+
+    /// The meter bridge is offered only once a mixing console is configured.
+    var availableAnalysisDisplayModes: [AnalysisDisplayMode] {
+        AnalysisDisplayMode.allCases.filter {
+            $0 != .meterBridge || settings.mixer.kind != .none
+        }
+    }
+
+    func setMixerKind(_ kind: MixerKind) {
+        guard settings.mixer.kind != kind else { return }
+        settings.mixer.kind = kind
+        if kind == .none, settings.spectrogram.displayMode == .meterBridge {
+            settings.spectrogram.displayMode = .none
+        }
+    }
+
+    func setMixerAddress(_ address: String) {
+        let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard settings.mixer.address != trimmed else { return }
+        settings.mixer.address = trimmed
+    }
+
+    func setMixerSection(_ section: MixerMeterSectionDescriptor, isVisible: Bool) {
+        guard settings.mixer.isVisible(section) != isVisible else { return }
+        settings.mixer.sectionVisibility[section.id] = isVisible
     }
 
     func selectReferenceChannel(_ channel: Int?) {
@@ -321,6 +363,7 @@ final class MeterModel: ObservableObject {
     func shutdown() {
         timer?.invalidate()
         timer = nil
+        mixerBridge.shutdown()
         stopRecording(waitUntilClosed: true, finalStatus: .interrupted)
         for closingLogger in closingLoggers {
             closingLogger.stop(waitUntilClosed: true)
@@ -453,7 +496,7 @@ final class MeterModel: ObservableObject {
 
     private func consumeAnalysisSignalFrames() {
         let displayMode = settings.spectrogram.displayMode
-        guard displayMode != .none else { return }
+        guard displayMode.usesAudioAnalysis else { return }
         let frames = engine.takeAnalysisSignalFrames()
         guard !frames.isEmpty else { return }
         let frequencyRange = settings.spectrogram.frequencyRange

@@ -8,6 +8,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     case input
     case display
     case analysis
+    case mixer
     case alerts
     case recording
 
@@ -18,6 +19,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .input: L10n.text("Vstup a kalibrace")
         case .display: L10n.text("Zobrazená měření")
         case .analysis: L10n.text("Analýza")
+        case .mixer: L10n.text("Mixpult")
         case .alerts: L10n.text("Upozornění a alarmy")
         case .recording: L10n.text("Záznam a historie")
         }
@@ -28,6 +30,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .input: "mic"
         case .display: "rectangle.split.3x1"
         case .analysis: "waveform"
+        case .mixer: "slider.vertical.3"
         case .alerts: "bell"
         case .recording: "record.circle"
         }
@@ -127,7 +130,7 @@ struct SettingsView: View {
             return !model.isRunning || model.selectedCalibration == nil ? .orange : nil
         case .recording:
             return model.isRecording ? .red : nil
-        case .display, .analysis, .alerts:
+        case .display, .analysis, .mixer, .alerts:
             return nil
         }
     }
@@ -138,6 +141,7 @@ struct SettingsView: View {
         case .input: scrolling { inputSection }
         case .display: scrolling { displaySection }
         case .analysis: scrolling { analysisSection }
+        case .mixer: scrolling { mixerSection }
         case .alerts: scrolling { alertsSection }
         case .recording: recordingSection
         }
@@ -369,7 +373,7 @@ struct SettingsView: View {
         HStack(alignment: .top, spacing: 16) {
             settingsGroup(L10n.text("Zobrazení analýzy")) {
                 Picker(L10n.text("Zobrazení analýzy"), selection: analysisDisplayModeBinding) {
-                    ForEach(AnalysisDisplayMode.allCases) { mode in
+                    ForEach(model.availableAnalysisDisplayModes) { mode in
                         Text(mode.title).tag(mode)
                     }
                 }
@@ -520,6 +524,59 @@ struct SettingsView: View {
                     }
                     .padding(16)
                     .frame(width: 380)
+                }
+            }
+        }
+    }
+
+    // MARK: - Mixing console
+
+    private var mixerSection: some View {
+        HStack(alignment: .top, spacing: 16) {
+            settingsGroup(L10n.text("Připojení mixpultu")) {
+                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+                    settingRow(L10n.text("Typ")) {
+                        Picker(L10n.text("Typ"), selection: mixerKindBinding) {
+                            ForEach(MixerKind.allCases) { kind in
+                                Text(kind.title).tag(kind)
+                            }
+                        }
+                        .labelsHidden()
+                        .fixedSize()
+                    }
+                    if model.settings.mixer.kind != .none {
+                        settingRow(L10n.text("Adresa")) {
+                            MixerAddressField(
+                                address: model.settings.mixer.address,
+                                commit: model.setMixerAddress
+                            )
+                            .frame(maxWidth: 220)
+                        }
+                    }
+                }
+
+                MixerStatusLine(bridge: model.mixerBridge)
+
+                if model.settings.mixer.kind != .none {
+                    caption(L10n.text("Prázdná adresa znamená automatické vyhledání v síti. Pokud se mixpult nenajde, zadejte jeho IP adresu a v Nastavení systému povolte přístup k místní síti."))
+                }
+            }
+
+            if model.settings.mixer.kind != .none {
+                settingsGroup(L10n.text("Sekce meter bridge")) {
+                    LazyVGrid(
+                        columns: Array(
+                            repeating: GridItem(.flexible(), alignment: .leading),
+                            count: 3
+                        ),
+                        alignment: .leading,
+                        spacing: 6
+                    ) {
+                        ForEach(model.settings.mixer.kind.sections) { section in
+                            Toggle(section.title, isOn: mixerSectionBinding(section))
+                                .lineLimit(1)
+                        }
+                    }
                 }
             }
         }
@@ -766,6 +823,20 @@ struct SettingsView: View {
         )
     }
 
+    private var mixerKindBinding: Binding<MixerKind> {
+        Binding(
+            get: { model.settings.mixer.kind },
+            set: model.setMixerKind
+        )
+    }
+
+    private func mixerSectionBinding(_ section: MixerMeterSectionDescriptor) -> Binding<Bool> {
+        Binding(
+            get: { model.settings.mixer.isVisible(section) },
+            set: { model.setMixerSection(section, isVisible: $0) }
+        )
+    }
+
     private var referenceChannelBinding: Binding<Int?> {
         Binding(
             get: { model.settings.spectrogram.referenceChannel },
@@ -839,6 +910,62 @@ struct SettingsView: View {
             }
             .padding(8)
             .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+        }
+    }
+}
+
+/// Commits when editing ends, so typing does not restart the connection.
+private struct MixerAddressField: View {
+    let address: String
+    let commit: (String) -> Void
+
+    @State private var draft = ""
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        TextField("", text: $draft, prompt: Text(L10n.text("Automaticky")))
+            .labelsHidden()
+            .focused($isFocused)
+            .onAppear { draft = address }
+            .onSubmit { commit(draft) }
+            .onChange(of: isFocused) { focused in
+                if !focused { commit(draft) }
+            }
+            .onChange(of: address) { newValue in
+                if !isFocused { draft = newValue }
+            }
+            .onDisappear { commit(draft) }
+    }
+}
+
+private struct MixerStatusLine: View {
+    @ObservedObject var bridge: MixerBridgeModel
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Circle()
+                .fill(bridge.phase.isConnected ? Color.green : Color.secondary)
+                .frame(width: 8, height: 8)
+            Text(statusText)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var statusText: String {
+        switch bridge.phase {
+        case .disabled:
+            return L10n.text("Mixpult není nastaven.")
+        case .connecting:
+            return L10n.text("Hledám mixpult…")
+        case .waitingToRetry:
+            return L10n.text("Mixpult není dostupný. Připojení se opakuje automaticky.")
+        case .connected(let identity):
+            let description = identity.name.isEmpty
+                ? identity.address
+                : "\(identity.name) (\(identity.address))"
+            return L10n.format("Připojeno: %@", description)
         }
     }
 }

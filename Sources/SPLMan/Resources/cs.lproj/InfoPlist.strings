@@ -1,1 +1,2 @@
 "NSMicrophoneUsageDescription" = "SPL Man potřebuje přístup ke zvukovému vstupu pro měření hladiny akustického tlaku.";
+"NSLocalNetworkUsageDescription" = "SPL Man se připojuje k mixpultu, aby mohl zobrazit jeho měřiče úrovně.";

@@ -39,6 +39,13 @@ struct MeterView: View {
                     .allowsHitTesting(false)
                 }
 
+                if model.settings.spectrogram.displayMode == .meterBridge {
+                    MixerBridgeView(bridge: model.mixerBridge)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .accessibilityHidden(true)
+                        .allowsHitTesting(false)
+                }
+
                 HStack(spacing: 0) {
                     ForEach(model.settings.displayedMetrics) { metric in
                         MetricColumn(
@@ -733,6 +740,7 @@ private struct ClockColumn: View {
         case .spectrogram: "waveform"
         case .transferFunction: "waveform.path.ecg"
         case .combined: "waveform.path.ecg"
+        case .meterBridge: "slider.vertical.3"
         case .none: "eye.slash"
         }
     }
@@ -742,6 +750,7 @@ private struct ClockColumn: View {
         case .spectrogram: "SPEC"
         case .transferFunction: "TF"
         case .combined: "TF+SPEC"
+        case .meterBridge: "MTR"
         case .none: "—"
         }
     }

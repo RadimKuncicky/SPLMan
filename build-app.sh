@@ -41,6 +41,7 @@ plutil -insert NSHighResolutionCapable -bool true "$PLIST"
 plutil -insert NSPrincipalClass -string NSApplication "$PLIST"
 plutil -insert LSApplicationCategoryType -string public.app-category.utilities "$PLIST"
 plutil -insert NSMicrophoneUsageDescription -string "SPL Man needs audio input access to measure sound pressure levels." "$PLIST"
+plutil -insert NSLocalNetworkUsageDescription -string "SPL Man connects to your mixing console to show its level meters." "$PLIST"
 
 codesign --force --sign - "$APP_DIR"
 echo "$APP_DIR"
