@@ -2,8 +2,8 @@
 
 SPL Man is a native macOS sound level meter for live sound workflows, designed
 for wide 1920 × 480 displays. It provides calibrated A-, C-, and Z-weighted
-measurements, rolling Leq metrics, peak monitoring, CSV recording, and session
-history.
+measurements, rolling Leq metrics, peak monitoring, spectrogram and transfer
+function analysis, CSV recording, and session history.
 
 ## Application preview
 
@@ -33,6 +33,11 @@ calibration, remove the calibrator and select **Start Input** so the time window
 begin without the calibration tone. The app never switches to another device
 automatically. If the saved input is unavailable, measurement remains stopped.
 
+Settings are divided into five sections: input and calibration, displayed
+measurements, analysis, alerts and alarms, and recording and history. Under
+displayed measurements, you can choose which values appear and change the order
+of the display columns.
+
 ## Measurements
 
 - LAeq, LCeq, and LZeq for each completed second, including LAFmax, LASmax, and
@@ -47,6 +52,40 @@ automatically. If the saved input is unavailable, measurement remains stopped.
 LAFmax and LCpeak are maxima since the input was started and reset when the
 input is restarted. LCpeak has no corresponding A-weighted peak metric, so C−A
 is not shown for it.
+
+## Analysis
+
+The analysis section of Settings selects what is displayed: the spectrogram, the
+transfer function, both, or nothing (the default). Neither view affects the
+measured values.
+
+### Spectrogram
+
+The spectrogram runs behind the measurements and shows relative signal energy
+normalized to 1/24-octave bandwidth. After calibration, its colors show an approximate
+unweighted level (Z); without calibration, they use a relative dBFS scale ending
+at 0 dBFS. You can adjust:
+
+- Frequency range: 20 Hz–20 kHz, 50 Hz–10 kHz, or 100 Hz–5 kHz; the actual upper
+  limit depends on the input sample rate
+- History: 10, 30, or 60 seconds
+- Intensity and color scale
+- Upper limit (40–140 dB, default 100 dB) and dynamic range (10–100 dB, default
+  50 dB)
+
+### Transfer function
+
+The transfer function compares the measurement channel with a selected reference
+channel, so it requires an input with at least two channels. The curve uses
+continuous impulse-response alignment and frequency-dependent time windowing,
+and is averaged over 5 seconds.
+
+- Smoothing: 1/48, 1/24, 1/12, 1/6, 1/3, or 1 octave (default 1/6); changing it
+  restarts only the curve averaging
+- Vertical range: ±3 to ±60 dB (default ±12 dB), centered automatically, with
+  reference lines every 6 dB
+- Coherence: the trace fades out where coherence drops below 0.8, reaching its
+  minimum at 0.3, so unreliable parts of the curve are easy to recognize
 
 ## Recording, sessions, and history
 
