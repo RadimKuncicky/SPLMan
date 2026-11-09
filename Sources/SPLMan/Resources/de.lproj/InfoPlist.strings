@@ -1,2 +1,2 @@
 "NSMicrophoneUsageDescription" = "SPL Man benötigt Zugriff auf den Audioeingang, um Schalldruckpegel zu messen.";
-"NSLocalNetworkUsageDescription" = "SPL Man verbindet sich mit Ihrem Mischpult, um dessen Pegelanzeigen darzustellen.";
+"NSLocalNetworkUsageDescription" = "SPL Man verbindet sich mit Ihrem Mischpult und Ihren Funkmikrofon-Empfängern, um deren Pegel und Status darzustellen.";

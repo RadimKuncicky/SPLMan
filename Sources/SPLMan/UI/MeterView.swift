@@ -46,6 +46,13 @@ struct MeterView: View {
                         .allowsHitTesting(false)
                 }
 
+                if model.settings.spectrogram.displayMode == .wireless {
+                    WirelessMonitorView(monitor: model.wirelessMonitor)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .accessibilityHidden(true)
+                        .allowsHitTesting(false)
+                }
+
                 HStack(spacing: 0) {
                     ForEach(model.settings.displayedMetrics) { metric in
                         MetricColumn(
@@ -741,6 +748,7 @@ private struct ClockColumn: View {
         case .transferFunction: "waveform.path.ecg"
         case .combined: "waveform.path.ecg"
         case .meterBridge: "slider.vertical.3"
+        case .wireless: "antenna.radiowaves.left.and.right"
         case .none: "eye.slash"
         }
     }
@@ -751,6 +759,7 @@ private struct ClockColumn: View {
         case .transferFunction: "TF"
         case .combined: "TF+SPEC"
         case .meterBridge: "MTR"
+        case .wireless: "MIC"
         case .none: "—"
         }
     }

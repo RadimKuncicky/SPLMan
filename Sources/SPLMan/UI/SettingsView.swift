@@ -9,6 +9,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     case display
     case analysis
     case mixer
+    case wireless
     case alerts
     case recording
 
@@ -20,6 +21,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .display: L10n.text("Zobrazená měření")
         case .analysis: L10n.text("Analýza")
         case .mixer: L10n.text("Mixpult")
+        case .wireless: L10n.text("Bezdrátové mikrofony")
         case .alerts: L10n.text("Upozornění a alarmy")
         case .recording: L10n.text("Záznam a historie")
         }
@@ -31,6 +33,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .display: "rectangle.split.3x1"
         case .analysis: "waveform"
         case .mixer: "slider.vertical.3"
+        case .wireless: "antenna.radiowaves.left.and.right"
         case .alerts: "bell"
         case .recording: "record.circle"
         }
@@ -130,7 +133,7 @@ struct SettingsView: View {
             return !model.isRunning || model.selectedCalibration == nil ? .orange : nil
         case .recording:
             return model.isRecording ? .red : nil
-        case .display, .analysis, .mixer, .alerts:
+        case .display, .analysis, .mixer, .wireless, .alerts:
             return nil
         }
     }
@@ -142,6 +145,7 @@ struct SettingsView: View {
         case .display: scrolling { displaySection }
         case .analysis: scrolling { analysisSection }
         case .mixer: scrolling { mixerSection }
+        case .wireless: scrolling { wirelessSection }
         case .alerts: scrolling { alertsSection }
         case .recording: recordingSection
         }
@@ -582,6 +586,39 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - Wireless microphones
+
+    private var wirelessSection: some View {
+        HStack(alignment: .top, spacing: 16) {
+            settingsGroup(L10n.text("Přijímače Shure")) {
+                Toggle(L10n.text("Sledovat bezdrátové mikrofony"), isOn: wirelessEnabledBinding)
+
+                if model.settings.wireless.isEnabled {
+                    Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+                        settingRow(L10n.text("Adresy")) {
+                            MixerAddressField(
+                                address: model.settings.wireless.addresses,
+                                commit: model.setWirelessAddresses
+                            )
+                            .frame(maxWidth: 300)
+                        }
+                    }
+                    WirelessScanButton(
+                        monitor: model.wirelessMonitor,
+                        scan: model.wirelessMonitor.scanNetwork
+                    )
+                    caption(L10n.text("Přijímače ULX-D, SLX-D a QLX-D se hledají automaticky podle toho, co samy oznamují v síti. Pokud se některý nenajde, zadejte jeho IP adresu (více adres oddělte čárkou) nebo prohledejte síť: aplikace se pak zeptá všech adres ve vaší podsíti /24 na portu 2202. Z přijímačů se jen čte a nic se v nich nemění."))
+                }
+            }
+
+            if model.settings.wireless.isEnabled {
+                settingsGroup(L10n.text("Nalezené přijímače")) {
+                    WirelessReceiverList(monitor: model.wirelessMonitor)
+                }
+            }
+        }
+    }
+
     // MARK: - Alerts and alarms
 
     private var alertsSection: some View {
@@ -837,6 +874,13 @@ struct SettingsView: View {
         )
     }
 
+    private var wirelessEnabledBinding: Binding<Bool> {
+        Binding(
+            get: { model.settings.wireless.isEnabled },
+            set: model.setWirelessEnabled
+        )
+    }
+
     private var referenceChannelBinding: Binding<Int?> {
         Binding(
             get: { model.settings.spectrogram.referenceChannel },
@@ -966,6 +1010,69 @@ private struct MixerStatusLine: View {
                 ? identity.address
                 : "\(identity.name) (\(identity.address))"
             return L10n.format("Připojeno: %@", description)
+        }
+    }
+}
+
+private struct WirelessScanButton: View {
+    @ObservedObject var monitor: WirelessMonitorModel
+    let scan: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button(L10n.text("Prohledat síť"), action: scan)
+                .disabled(monitor.isScanning)
+            if monitor.isScanning {
+                ProgressView()
+                    .controlSize(.small)
+                Text(L10n.text("Prohledávám síť…"))
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+private struct WirelessReceiverList: View {
+    @ObservedObject var monitor: WirelessMonitorModel
+
+    var body: some View {
+        if monitor.receivers.isEmpty {
+            Text(L10n.text("Zatím nebyl nalezen žádný přijímač."))
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        } else {
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(monitor.receivers) { receiver in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Circle()
+                            .fill(receiver.phase == .connected ? Color.green : Color.secondary)
+                            .frame(width: 8, height: 8)
+                        Text(verbatim: title(of: receiver))
+                            .lineLimit(1)
+                        Text(statusText(of: receiver))
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+            }
+        }
+    }
+
+    private func title(of receiver: WirelessReceiverStatus) -> String {
+        let description = [receiver.model, receiver.name]
+            .filter { !$0.isEmpty }
+            .joined(separator: " · ")
+        return description.isEmpty ? receiver.address : "\(description) (\(receiver.address))"
+    }
+
+    private func statusText(of receiver: WirelessReceiverStatus) -> String {
+        switch receiver.phase {
+        case .connecting: L10n.text("Připojuji…")
+        case .connected: L10n.text("Připojeno")
+        case .unsupported: L10n.text("Tento model není podporován.")
+        case .unavailable: L10n.text("Nedostupný. Připojení se opakuje automaticky.")
         }
     }
 }

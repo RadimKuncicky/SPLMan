@@ -123,6 +123,7 @@ enum AnalysisDisplayMode: String, CaseIterable, Codable, Identifiable {
     case transferFunction
     case combined
     case meterBridge
+    case wireless
     case none
 
     var id: String { rawValue }
@@ -133,6 +134,7 @@ enum AnalysisDisplayMode: String, CaseIterable, Codable, Identifiable {
         case .transferFunction: L10n.text("Přenosová charakteristika")
         case .combined: L10n.text("Přenosová charakteristika a spektrogram")
         case .meterBridge: L10n.text("Meter bridge")
+        case .wireless: L10n.text("Bezdrátové mikrofony")
         case .none: L10n.text("Nic")
         }
     }
@@ -154,7 +156,8 @@ enum AnalysisDisplayMode: String, CaseIterable, Codable, Identifiable {
         case .spectrogram: .transferFunction
         case .transferFunction: .combined
         case .combined: .meterBridge
-        case .meterBridge: .none
+        case .meterBridge: .wireless
+        case .wireless: .none
         case .none: .spectrogram
         }
     }
@@ -324,6 +327,7 @@ struct PersistedSettings: Codable, Equatable {
     var thresholds = VisualThresholds()
     var spectrogram = SpectrogramSettings()
     var mixer = MixerSettings()
+    var wireless = WirelessSettings()
 
     private enum CodingKeys: String, CodingKey {
         case input
@@ -332,6 +336,7 @@ struct PersistedSettings: Codable, Equatable {
         case thresholds
         case spectrogram
         case mixer
+        case wireless
     }
 
     init() {}
@@ -354,6 +359,8 @@ struct PersistedSettings: Codable, Equatable {
             ?? SpectrogramSettings()
         mixer = (try? container.decodeIfPresent(MixerSettings.self, forKey: .mixer))
             ?? MixerSettings()
+        wireless = (try? container.decodeIfPresent(WirelessSettings.self, forKey: .wireless))
+            ?? WirelessSettings()
     }
 }
 

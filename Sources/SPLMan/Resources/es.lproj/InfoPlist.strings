@@ -1,2 +1,2 @@
 "NSMicrophoneUsageDescription" = "SPL Man necesita acceso a la entrada de audio para medir niveles de presión sonora.";
-"NSLocalNetworkUsageDescription" = "SPL Man se conecta a su mesa de mezclas para mostrar sus medidores de nivel.";
+"NSLocalNetworkUsageDescription" = "SPL Man se conecta a su mesa de mezclas y a los receptores de micrófonos inalámbricos para mostrar sus niveles y su estado.";

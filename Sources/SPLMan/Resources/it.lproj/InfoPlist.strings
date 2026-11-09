@@ -1,2 +1,2 @@
 "NSMicrophoneUsageDescription" = "SPL Man richiede l’accesso all’ingresso audio per misurare i livelli di pressione sonora.";
-"NSLocalNetworkUsageDescription" = "SPL Man si collega al mixer per mostrarne gli indicatori di livello.";
+"NSLocalNetworkUsageDescription" = "SPL Man si collega al mixer e ai ricevitori dei microfoni wireless per mostrarne i livelli e lo stato.";

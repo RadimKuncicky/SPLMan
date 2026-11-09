@@ -58,6 +58,9 @@ final class MeterModel: ObservableObject {
             if oldValue.mixer != settings.mixer {
                 mixerBridge.apply(settings.mixer)
             }
+            if oldValue.wireless != settings.wireless {
+                wirelessMonitor.apply(settings.wireless)
+            }
             if oldValue.spectrogram.displayMode != settings.spectrogram.displayMode {
                 engine.setSpectrogramCaptureEnabled(
                     settings.spectrogram.displayMode.usesAudioAnalysis
@@ -79,6 +82,7 @@ final class MeterModel: ObservableObject {
     }
 
     let mixerBridge: MixerBridgeModel
+    let wirelessMonitor: WirelessMonitorModel
 
     private let store: SettingsStore
     private let recordingErrorStore: RecordingErrorStore
@@ -105,6 +109,7 @@ final class MeterModel: ObservableObject {
     init(store: SettingsStore = SettingsStore()) {
         self.store = store
         mixerBridge = MixerBridgeModel()
+        wirelessMonitor = WirelessMonitorModel()
         recordingErrorStore = RecordingErrorStore()
         historyStore = RecordingHistoryStore()
         settings = store.load()
@@ -115,8 +120,12 @@ final class MeterModel: ObservableObject {
         if settings.spectrogram.displayMode == .meterBridge, settings.mixer.kind == .none {
             settings.spectrogram.displayMode = .none
         }
+        if settings.spectrogram.displayMode == .wireless, !settings.wireless.isEnabled {
+            settings.spectrogram.displayMode = .none
+        }
         engine.setSpectrogramCaptureEnabled(settings.spectrogram.displayMode.usesAudioAnalysis)
         mixerBridge.apply(settings.mixer)
+        wirelessMonitor.apply(settings.wireless)
         refreshDevices()
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.consumeAudioSnapshot() }
@@ -222,18 +231,38 @@ final class MeterModel: ObservableObject {
     }
 
     func cycleAnalysisDisplayMode() {
+        let available = availableAnalysisDisplayModes
         var mode = settings.spectrogram.displayMode.next
-        if !availableAnalysisDisplayModes.contains(mode) {
+        while !available.contains(mode) {
             mode = mode.next
         }
         setAnalysisDisplayMode(mode)
     }
 
-    /// The meter bridge is offered only once a mixing console is configured.
+    /// The meter bridge is offered only once a mixing console is configured, and
+    /// the wireless view only once monitoring is switched on.
     var availableAnalysisDisplayModes: [AnalysisDisplayMode] {
         AnalysisDisplayMode.allCases.filter {
-            $0 != .meterBridge || settings.mixer.kind != .none
+            switch $0 {
+            case .meterBridge: settings.mixer.kind != .none
+            case .wireless: settings.wireless.isEnabled
+            case .spectrogram, .transferFunction, .combined, .none: true
+            }
         }
+    }
+
+    func setWirelessEnabled(_ isEnabled: Bool) {
+        guard settings.wireless.isEnabled != isEnabled else { return }
+        settings.wireless.isEnabled = isEnabled
+        if !isEnabled, settings.spectrogram.displayMode == .wireless {
+            settings.spectrogram.displayMode = .none
+        }
+    }
+
+    func setWirelessAddresses(_ addresses: String) {
+        let trimmed = addresses.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard settings.wireless.addresses != trimmed else { return }
+        settings.wireless.addresses = trimmed
     }
 
     func setMixerKind(_ kind: MixerKind) {
@@ -364,6 +393,7 @@ final class MeterModel: ObservableObject {
         timer?.invalidate()
         timer = nil
         mixerBridge.shutdown()
+        wirelessMonitor.shutdown()
         stopRecording(waitUntilClosed: true, finalStatus: .interrupted)
         for closingLogger in closingLoggers {
             closingLogger.stop(waitUntilClosed: true)

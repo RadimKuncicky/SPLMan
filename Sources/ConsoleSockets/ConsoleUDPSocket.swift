@@ -114,7 +114,7 @@ public final class ConsoleUDPSocket {
         return String(cString: buffer)
     }
 
-    private static func readDatagrams(
+    static func readDatagrams(
         from descriptor: Int32,
         onDatagram: ([UInt8], in_addr) -> Void
     ) {

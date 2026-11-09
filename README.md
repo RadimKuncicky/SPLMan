@@ -114,6 +114,39 @@ bar, except main LR and the effect returns. The sections wrap into two rows when
 one row would make the bars too narrow. Bars are green below -18 dB, yellow from
 -18 dB, and red from 0 dB.
 
+## Wireless microphones
+
+SPL Man can show the channels of Shure wireless receivers behind the
+measurements: the channel name, the transmitter's battery, the audio level, and
+the received signal strength. SLX-D and ULX-D receivers are read through the small
+built-in `ShureKit` library, based on Shure's published command strings. QLX-D
+receivers use the same commands as ULX-D, but this has not been checked against a
+Shure document.
+
+Under **Wireless microphones** in Settings, switch on monitoring, then select
+**Wireless microphones** in the analysis section or with the analysis button on
+the display. Receivers are found in three ways:
+
+- **Automatically:** SPL Man listens for what receivers announce on the network
+  (SLP multicast on 239.255.254.253, port 8427). Shure does not document this for
+  third parties and it has only been described for QLX-D, so other models may not
+  appear this way.
+- **By address:** enter the IP addresses of receivers, separated by commas.
+- **By scanning:** **Scan Network** asks every address in the Mac's /24 subnet for
+  its model on TCP port 2202. It runs only when you press the button, because it
+  contacts every device on the network.
+
+The connection only reads data and never changes a receiver. For that reason it
+requests levels about 8 times per second instead of using the receiver's own
+metering, which would have to be switched on with a setting. Receivers that are
+lost keep their column, marked as offline, and are retried about every 5 seconds.
+
+The audio bar is green below -18 dBFS, yellow from -18 dBFS, and red at 0 dBFS. The
+signal bar shows -100 to -40 dBm, and is red below -85 dBm, yellow below -70 dBm,
+and green above; these thresholds are a practical guide, not a Shure specification.
+Other Shure models, such as Axient Digital, are not supported: discovery and
+scanning skip them, and an address entered for one is listed as not supported.
+
 ## Recording, sessions, and history
 
 Once the input is running and calibrated, use the Record button next to

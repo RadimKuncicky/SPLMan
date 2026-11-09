@@ -21,9 +21,16 @@ let package = Package(
             name: "X32Kit",
             dependencies: ["ConsoleSockets"]
         ),
+        .target(
+            name: "ShureKit",
+            dependencies: ["ConsoleSockets"],
+            linkerSettings: [
+                .linkedFramework("Network")
+            ]
+        ),
         .executableTarget(
             name: "SPLMan",
-            dependencies: ["WingKit", "X32Kit"],
+            dependencies: ["WingKit", "X32Kit", "ShureKit"],
             resources: [.process("Resources")],
             linkerSettings: [
                 .linkedFramework("AppKit"),

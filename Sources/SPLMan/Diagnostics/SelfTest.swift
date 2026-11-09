@@ -47,6 +47,7 @@ enum SelfTest {
         testSettingsKeepCalibrationsOnPartialDecodeFailure(&failures)
         testRecordingEventHistory(&failures)
         failures.append(contentsOf: MixerTests.run())
+        failures.append(contentsOf: WirelessTests.run())
         failures.append(contentsOf: LocalizationValidation.run())
         if !DSPValidation.run() {
             failures.append("DSP validation suite failed")
@@ -729,7 +730,8 @@ enum SelfTest {
         if AnalysisDisplayMode.spectrogram.next != .transferFunction
             || AnalysisDisplayMode.transferFunction.next != .combined
             || AnalysisDisplayMode.combined.next != .meterBridge
-            || AnalysisDisplayMode.meterBridge.next != .none
+            || AnalysisDisplayMode.meterBridge.next != .wireless
+            || AnalysisDisplayMode.wireless.next != .none
             || AnalysisDisplayMode.none.next != .spectrogram {
             failures.append("Analysis display mode cycle order changed")
         }
