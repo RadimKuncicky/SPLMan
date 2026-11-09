@@ -1,9 +1,12 @@
 import Foundation
 
-/// The two documented command sets. SLX-D and ULX-D frame messages the same way
-/// but name and scale the metered properties differently.
+/// The documented command sets. SLX-D and ULX-D frame messages the same way
+/// but name and scale the metered properties differently. SLX-D+ (model names
+/// ending in "+", such as SLXD4Q+) is SLX-D with linked transmitters, whose
+/// model is read with LINK_TX_MODEL instead of TX_MODEL.
 public enum ShureDialect: Equatable {
     case slxd
+    case slxdPlus
     case ulxd
 }
 
@@ -25,8 +28,8 @@ public struct ShureReceiverModel: Equatable {
             return nil
         }
         self.name = normalized
-        dialect = family.dialect
-        // ULXD4D and SLXD4D are dual, ULXD4Q is quad.
+        dialect = family.dialect == .slxd && normalized.hasSuffix("+") ? .slxdPlus : family.dialect
+        // ULXD4D and SLXD4D are dual, ULXD4Q and SLXD4Q+ are quad.
         let suffix = normalized.dropFirst(family.prefix.count)
         channelCount = suffix.hasPrefix("Q") ? 4 : suffix.hasPrefix("D") ? 2 : 1
     }
@@ -155,14 +158,15 @@ public enum ShureProtocol {
 
     public static func meterRequests(_ dialect: ShureDialect, channel: Int) -> [[UInt8]] {
         switch dialect {
-        case .slxd: [request("\(channel) AUDIO_LEVEL_RMS")]
+        case .slxd, .slxdPlus: [request("\(channel) AUDIO_LEVEL_RMS")]
         case .ulxd: [request("\(channel) AUDIO_LVL")]
         }
     }
 
     public static func rfRequests(_ dialect: ShureDialect, channel: Int) -> [[UInt8]] {
         switch dialect {
-        case .slxd: [request("\(channel) RSSI 0")]
+        // The receiver answers with one report per antenna.
+        case .slxd, .slxdPlus: [request("\(channel) RSSI")]
         case .ulxd: [request("\(channel) RX_RF_LVL")]
         }
     }
@@ -171,6 +175,8 @@ public enum ShureProtocol {
         let properties: [String]
         switch dialect {
         case .slxd: properties = ["CHAN_NAME", "TX_MODEL", "TX_BATT_BARS", "TX_BATT_MINS"]
+        // Slot 1 is the only transmitter slot of a channel.
+        case .slxdPlus: properties = ["CHAN_NAME", "LINK_TX_MODEL 1", "TX_BATT_BARS", "TX_BATT_MINS"]
         case .ulxd: properties = ["CHAN_NAME", "TX_TYPE", "BATT_BARS", "BATT_RUN_TIME"]
         }
         return properties.map { request("\(channel) \($0)") }
@@ -201,7 +207,7 @@ public enum ShureProtocol {
             return .channelName(channel: channel, name: value)
         }
         switch dialect {
-        case .slxd:
+        case .slxd, .slxdPlus:
             switch property {
             case "AUDIO_LEVEL_RMS":
                 return .audioLevel(channel: channel, dBFS: scaled(value, valid: 0...120, offset: -120))
@@ -214,6 +220,10 @@ public enum ShureProtocol {
                 )
             case "TX_MODEL":
                 return .transmitter(channel: channel, model: transmitterModel(value))
+            case "LINK_TX_MODEL":
+                // < REP x LINK_TX_MODEL slot model >
+                guard tokens.count >= 5 else { return nil }
+                return .transmitter(channel: channel, model: transmitterModel(tokens[4]))
             case "TX_BATT_BARS":
                 return .batteryBars(channel: channel, bars: batteryBars(value))
             case "TX_BATT_MINS":

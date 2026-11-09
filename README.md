@@ -118,8 +118,9 @@ one row would make the bars too narrow. Bars are green below -18 dB, yellow from
 
 SPL Man can show the channels of Shure wireless receivers behind the
 measurements: the channel name, the transmitter's battery, the audio level, and
-the received signal strength. SLX-D and ULX-D receivers are read through the small
-built-in `ShureKit` library, based on Shure's published command strings. QLX-D
+the received signal strength. SLX-D, SLX-D+ (including the quad SLXD4Q+) and ULX-D
+receivers are read through the small built-in `ShureKit` library, based on Shure's
+published command strings. QLX-D
 receivers use the same commands as ULX-D, but this has not been checked against a
 Shure document.
 

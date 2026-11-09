@@ -43,6 +43,9 @@ enum WirelessTests {
         let expected: [(String, ShureDialect, Int)] = [
             ("SLXD4", .slxd, 1),
             ("SLXD4D", .slxd, 2),
+            ("SLXD4+", .slxdPlus, 1),
+            ("SLXD4D+", .slxdPlus, 2),
+            ("SLXD4Q+", .slxdPlus, 4),
             ("ULXD4", .ulxd, 1),
             ("ULXD4D", .ulxd, 2),
             ("ULXD4Q", .ulxd, 4),
@@ -69,7 +72,8 @@ enum WirelessTests {
         let metering: [(requests: [[UInt8]], expected: String)] = [
             (ShureProtocol.meterRequests(.slxd, channel: 1), "< GET 1 AUDIO_LEVEL_RMS >"),
             (ShureProtocol.meterRequests(.ulxd, channel: 2), "< GET 2 AUDIO_LVL >"),
-            (ShureProtocol.rfRequests(.slxd, channel: 2), "< GET 2 RSSI 0 >"),
+            (ShureProtocol.rfRequests(.slxd, channel: 2), "< GET 2 RSSI >"),
+            (ShureProtocol.rfRequests(.slxdPlus, channel: 4), "< GET 4 RSSI >"),
             (ShureProtocol.rfRequests(.ulxd, channel: 1), "< GET 1 RX_RF_LVL >")
         ]
         for entry in metering where entry.requests.map(text) != [entry.expected] {
@@ -77,7 +81,10 @@ enum WirelessTests {
         }
 
         var all = [ShureProtocol.modelRequest] + ShureProtocol.deviceRequests
-        for dialect in [ShureDialect.slxd, .ulxd] {
+        if ShureProtocol.statusRequests(.slxdPlus, channel: 3).map(text).contains("< GET 3 LINK_TX_MODEL 1 >") == false {
+            failures.append("SLX-D+ transmitter model request differs from the command reference")
+        }
+        for dialect in [ShureDialect.slxd, .slxdPlus, .ulxd] {
             all += ShureProtocol.meterRequests(dialect, channel: 1)
             all += ShureProtocol.rfRequests(dialect, channel: 1)
             all += ShureProtocol.statusRequests(dialect, channel: 1)
@@ -145,6 +152,17 @@ enum WirelessTests {
         ]
         for (text, expected) in cases where report(text, .slxd) != expected {
             failures.append("SLX-D report was read incorrectly: \(text)")
+        }
+        // Example values are those in the SLX-D+ command strings document.
+        let plusCases: [(String, ShureReport)] = [
+            ("< REP 4 AUDIO_LEVEL_RMS 102 >", .audioLevel(channel: 4, dBFS: -18)),
+            ("< REP 3 RSSI 2 064 >", .rfLevel(channel: 3, antenna: 2, dBm: -56)),
+            ("< REP 1 LINK_TX_MODEL 1 SLXD1+ >", .transmitter(channel: 1, model: "SLXD1+")),
+            ("< REP 1 LINK_TX_MODEL 1 UNKNOWN >", .transmitter(channel: 1, model: nil)),
+            ("< REP 2 TX_BATT_MINS 00360 >", .batteryMinutes(channel: 2, minutes: 360))
+        ]
+        for (text, expected) in plusCases where report(text, .slxdPlus) != expected {
+            failures.append("SLX-D+ report was read incorrectly: \(text)")
         }
     }
 
