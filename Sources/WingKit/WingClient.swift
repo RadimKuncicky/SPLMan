@@ -1,6 +1,7 @@
 import ConsoleSockets
 import Foundation
 import Network
+import os
 
 /// One read-only metering session with a Behringer WING: optional discovery,
 /// the TCP control connection and the UDP meter stream. All work happens on a
@@ -32,6 +33,12 @@ public final class WingClient {
     /// Requesting names regularly also keeps linked names current.
     private static let renewalsPerNameRefresh = 10
     private static let connectionTimeoutSeconds = 5
+    private static let log = Logger(subsystem: "cz.splman.wingkit", category: "session")
+    /// A group the console does not have may never report.
+    private static let measurementTimeout: TimeInterval = 0.5
+    /// A real console kept sending only one of several simultaneous reports, so
+    /// all groups share one, like the single request of the wapi library.
+    private static let combinedReportID: UInt32 = 1
 
     private let queue = DispatchQueue(label: "cz.splman.wingkit", qos: .userInitiated)
     private let meterGroups: [[WingMeter]]
@@ -53,10 +60,16 @@ public final class WingClient {
     private var discoveriesSent = 0
     private var renewalTimer: DispatchSourceTimer?
     private var renewalsSinceNameRefresh = 0
+    private var measurementTimer: DispatchSourceTimer?
+    /// Values per group, in group order, as far as they are known.
+    private var groupLengths: [Int] = []
+    private var connectedAt: TimeInterval?
+    private var reportsReceived = 0
+    private var ignoredDatagrams = 0
 
     /// - Parameters:
     ///   - address: The console's address, or nil to find it by broadcast.
-    ///   - meterGroups: Each group arrives as its own report.
+    ///   - meterGroups: The values of each group are kept apart in `Snapshot.reports`.
     ///   - nameNodes: Text parameters to read and keep current.
     public init(address: String?, meterGroups: [[WingMeter]], nameNodes: [Int32]) {
         self.address = address
@@ -75,7 +88,10 @@ public final class WingClient {
     }
 
     public func stop() {
-        queue.sync { tearDown() }
+        queue.sync {
+            if connection != nil { logSessionEnd("stopped by the application") }
+            tearDown()
+        }
     }
 
     public func snapshot() -> Snapshot {
@@ -102,7 +118,7 @@ public final class WingClient {
             self?.handleDatagram(datagram)
         }
         guard let socket else {
-            fail()
+            fail("no UDP socket")
             return
         }
         if let address {
@@ -119,15 +135,29 @@ public final class WingClient {
         }
     }
 
-    private func fail() {
+    private func fail(_ reason: String) {
         guard state != .failed else { return }
         state = .failed
+        logSessionEnd(reason)
         tearDown()
+    }
+
+    /// The application retries silently, so this is the only record of why a
+    /// session ended and whether the console was still sending each report.
+    private func logSessionEnd(_ reason: String) {
+        let now = ProcessInfo.processInfo.systemUptime
+        let connected = connectedAt.map { String(format: "%.1f s", now - $0) } ?? "never"
+        let silence = lastMeterDataAt.map { String(format: "%.1f s", now - $0) } ?? "no data"
+        let summary = "connected: \(connected), meter silence: \(silence), "
+            + "group lengths: \(groupLengths), reports: \(reportsReceived), ignored: \(ignoredDatagrams)"
+        Self.log.notice("Session ended: \(reason, privacy: .public); \(summary, privacy: .public)")
     }
 
     private func tearDown() {
         discoveryTimer?.cancel()
         discoveryTimer = nil
+        measurementTimer?.cancel()
+        measurementTimer = nil
         renewalTimer?.cancel()
         renewalTimer = nil
         connection?.stateUpdateHandler = nil
@@ -157,7 +187,7 @@ public final class WingClient {
             return
         }
         guard discoveriesSent < Self.discoveryAttempts else {
-            fail()
+            fail("no discovery reply")
             return
         }
         discoveriesSent += 1
@@ -178,10 +208,30 @@ public final class WingClient {
             }
             return
         }
-        guard let report = WingMeterReport(packet: datagram),
-              report.reportID >= 1,
-              report.reportID <= UInt32(reports.count) else { return }
-        reports[Int(report.reportID) - 1] = report.words
+        guard let report = WingMeterReport(packet: datagram) else {
+            ignoredDatagrams += 1
+            return
+        }
+        if state == .connected, report.reportID == Self.combinedReportID {
+            applyCombined(report)
+        } else if measurementTimer != nil, report.reportID == measurementReportID {
+            groupLengths.append(report.words.count)
+            measureNextGroup()
+        } else {
+            // Includes what a console still sends for an earlier measurement.
+            ignoredDatagrams += 1
+        }
+    }
+
+    private func applyCombined(_ report: WingMeterReport) {
+        guard let groups = WingProtocol.split(report.words, lengths: groupLengths) else {
+            // For example a card was exchanged. Reconnecting measures again, and
+            // values must not be shown on the wrong strips until then.
+            fail("report of \(report.words.count) values does not match the groups")
+            return
+        }
+        reports = groups
+        reportsReceived += 1
         lastMeterDataAt = ProcessInfo.processInfo.systemUptime
     }
 
@@ -189,7 +239,7 @@ public final class WingClient {
 
     private func openConnection(to address: String) {
         guard let port = NWEndpoint.Port(rawValue: WingProtocol.port) else {
-            fail()
+            fail("invalid TCP port")
             return
         }
         let options = NWProtocolTCP.Options()
@@ -211,36 +261,72 @@ public final class WingClient {
         switch connectionState {
         case .ready:
             subscribe()
-        case .failed:
-            fail()
+        case .failed(let error):
+            fail("connection failed: \(error)")
+        case .waiting(let error):
+            // The system retries when the network or the local network permission
+            // changes. The caller limits the total time.
+            let description = "\(error)"
+            Self.log.notice("Connection waiting: \(description, privacy: .public)")
         default:
-            // While waiting, the system retries when the network or the local
-            // network permission changes. The caller limits the total time.
             break
         }
     }
 
     private func subscribe() {
         guard let meterPort = socket?.port else {
-            fail()
+            fail("no UDP socket")
             return
         }
-        var message = WingProtocol.selectControlChannel + WingProtocol.meterPort(meterPort)
-        for (index, meters) in meterGroups.enumerated() {
-            message += WingProtocol.meterRequest(reportID: UInt32(index + 1), meters: meters)
-        }
-        transmit(message + nameRequests())
+        transmit(
+            WingProtocol.selectControlChannel + WingProtocol.meterPort(meterPort) + nameRequests()
+        )
         receiveStream()
+        measureNextGroup()
+    }
+
+    /// A combined report does not say where each group starts, and the number of
+    /// connectors depends on the model and its cards. So each group is requested
+    /// alone once, and its first report tells its length.
+    private func measureNextGroup() {
+        measurementTimer?.cancel()
+        measurementTimer = nil
+        let group = groupLengths.count
+        guard group < meterGroups.count else {
+            startStreaming()
+            return
+        }
+        transmit(WingProtocol.meterRequest(
+            reportID: measurementReportID,
+            meters: meterGroups[group]
+        ))
+        measurementTimer = makeTimer(interval: Self.measurementTimeout) { [weak self] in
+            self?.groupLengths.append(0)
+            self?.measureNextGroup()
+        }
+    }
+
+    /// Differs from the combined report, which must not be mistaken for a group.
+    private var measurementReportID: UInt32 {
+        Self.combinedReportID + 1 + UInt32(groupLengths.count)
+    }
+
+    private func startStreaming() {
+        let meters: [WingMeter] = zip(meterGroups, groupLengths).flatMap { group, length in
+            length > 0 ? group : []
+        }
+        transmit(WingProtocol.meterRequest(reportID: Self.combinedReportID, meters: meters))
         renewalTimer = makeTimer(interval: Self.renewalInterval) { [weak self] in
             self?.renewMeters()
         }
+        connectedAt = ProcessInfo.processInfo.systemUptime
         state = .connected
+        let lengths = groupLengths.description
+        Self.log.notice("Connected: group lengths \(lengths, privacy: .public)")
     }
 
     private func renewMeters() {
-        var message = (0..<meterGroups.count).flatMap {
-            WingProtocol.meterRenewal(reportID: UInt32($0 + 1))
-        }
+        var message = WingProtocol.meterRenewal(reportID: Self.combinedReportID)
         renewalsSinceNameRefresh += 1
         if renewalsSinceNameRefresh >= Self.renewalsPerNameRefresh {
             renewalsSinceNameRefresh = 0
@@ -256,7 +342,9 @@ public final class WingClient {
     private func transmit(_ bytes: [UInt8]) {
         guard !bytes.isEmpty else { return }
         connection?.send(content: Data(bytes), completion: .contentProcessed { [weak self] error in
-            if error != nil { self?.fail() }
+            // Sends still pending when the session is stopped report an error too.
+            guard let self, let error, self.connection != nil else { return }
+            self.fail("send failed: \(error)")
         })
     }
 
@@ -268,8 +356,10 @@ public final class WingClient {
             if let data, !data.isEmpty {
                 self.applyNames(self.parser.consume([UInt8](data)))
             }
-            if isComplete || error != nil {
-                self.fail()
+            if let error {
+                self.fail("receive failed: \(error)")
+            } else if isComplete {
+                self.fail("console closed the connection")
             } else {
                 self.receiveStream()
             }

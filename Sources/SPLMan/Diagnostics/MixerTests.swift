@@ -116,6 +116,12 @@ enum MixerTests {
         if WingProtocol.meterRenewal(reportID: 2) != renewal {
             failures.append("WING meter renewal differs from the protocol example")
         }
+        if WingProtocol.split([1, 2, 3], lengths: [2, 0, 1]) != [[1, 2], [], [3]] {
+            failures.append("A combined WING report was not split into its groups")
+        }
+        if WingProtocol.split([1, 2, 3], lengths: [2]) != nil {
+            failures.append("A WING report that does not match its groups was accepted")
+        }
         let escapedPort: [UInt8] = [0xdf, 0xd3, 0xd3, 0xdf, 0xde, 0x12, 0xdf, 0xd1]
         if WingProtocol.meterPort(0xdf12) != escapedPort {
             failures.append("WING escape byte in a port number was not escaped")

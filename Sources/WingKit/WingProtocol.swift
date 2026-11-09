@@ -102,6 +102,17 @@ public enum WingProtocol {
         return meterMessage(payload)
     }
 
+    /// Cuts a report into consecutive groups of the given lengths, or returns nil
+    /// when they do not add up to the whole report.
+    public static func split(_ words: [Int16], lengths: [Int]) -> [[Int16]]? {
+        guard lengths.reduce(0, +) == words.count else { return nil }
+        var start = 0
+        return lengths.map { length in
+            defer { start += length }
+            return Array(words[start..<(start + length)])
+        }
+    }
+
     /// Must be sent on the control channel.
     public static func nodeDataRequest(node: Int32) -> [UInt8] {
         var payload: [UInt8] = [0xd7]

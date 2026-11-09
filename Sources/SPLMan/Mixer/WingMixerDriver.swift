@@ -171,8 +171,8 @@ final class WingMixerDriver: MixerDriver {
         )
     }
 
-    /// One report holds all connectors of a group, and its length tells how many
-    /// there are. Only the console's local connectors are shown by default.
+    /// A group holds all its connectors, and its length tells how many there are.
+    /// Only the console's local connectors are shown by default.
     private static func connectorGroup(
         _ id: String,
         _ title: String,
