@@ -77,7 +77,26 @@ final class WingMixerDriver: MixerDriver {
     private var nameTargets: [Int32: (section: String, strip: Int)] = [:]
     private var namesRevision = 0
 
-    func start(address: String?, sections: [MixerMeterSectionDescriptor]) {
+    /// Accepts only the discovery reply of the selected console; nil accepts
+    /// the first console that answers.
+    static func discoveryFilter(for target: PreferredMixer?) -> ((WingConsoleInfo) -> Bool)? {
+        guard let target else { return nil }
+        return { info in
+            target.matches(
+                kind: .behringerWing,
+                name: info.name,
+                model: info.model,
+                serial: info.serial,
+                address: info.ip
+            )
+        }
+    }
+
+    func start(
+        address: String?,
+        target: PreferredMixer?,
+        sections: [MixerMeterSectionDescriptor]
+    ) {
         stop()
         let requested = Set(sections.map(\.id))
         active = Self.definitions.filter { requested.contains($0.descriptor.id) }
@@ -96,7 +115,8 @@ final class WingMixerDriver: MixerDriver {
                     isRequired: definition.descriptor.stripCount != nil
                 )
             },
-            nameNodes: active.flatMap(\.nameIDs)
+            nameNodes: active.flatMap(\.nameIDs),
+            discoveryFilter: address == nil ? Self.discoveryFilter(for: target) : nil
         )
         self.client = client
         client.start()

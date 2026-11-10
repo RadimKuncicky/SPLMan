@@ -60,16 +60,45 @@ public struct X32Message: Equatable {
     }
 }
 
+/// Reply to `/xinfo`: the console's IP address, network name, model and
+/// firmware version. Unlike `/info`, it names the console, so consoles of the
+/// same model can be told apart.
+public struct X32ConsoleInfo: Equatable {
+    public let ip: String
+    public let name: String
+    public let model: String
+    public let firmware: String
+
+    public init(ip: String, name: String, model: String, firmware: String) {
+        self.ip = ip
+        self.name = name
+        self.model = model
+        self.firmware = firmware
+    }
+
+    public init?(message: X32Message) {
+        guard message.address == X32Protocol.xinfoAddress else { return nil }
+        let texts: [String] = message.arguments.compactMap {
+            if case .string(let text) = $0 { return text }
+            return nil
+        }
+        guard texts.count >= 4 else { return nil }
+        self.init(ip: texts[0], name: texts[1], model: texts[2], firmware: texts[3])
+    }
+}
+
 /// Read-only requests of the X32 remote protocol, as described in Patrick-Gilles
 /// Maillot's "Unofficial X32/M32 OSC Remote Protocol". Nothing here can change a
 /// console parameter: a message without arguments only reads a value.
 public enum X32Protocol {
     public static let port: UInt16 = 10023
     public static let infoAddress = "/info"
+    public static let xinfoAddress = "/xinfo"
 
     private static let meterAddressPrefix = "/meters/"
 
     public static var infoRequest: [UInt8] { read(infoAddress) }
+    public static var xinfoRequest: [UInt8] { read(xinfoAddress) }
 
     /// A console sends a page about every 50 ms for 10 seconds after a request.
     public static func meterRequest(page: Int) -> [UInt8] {

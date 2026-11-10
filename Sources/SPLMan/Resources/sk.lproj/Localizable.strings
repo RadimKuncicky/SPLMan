@@ -216,6 +216,14 @@
 "Mixpult není nastaven." = "Mixpult nie je nastavený.";
 "Hledám mixpult…" = "Hľadám mixpult…";
 "Mixpult není dostupný. Připojení se opakuje automaticky." = "Mixpult nie je dostupný. Pripojenie sa opakuje automaticky.";
+"Mixpulty na síti" = "Mixpulty v sieti";
+"Vyberte mixpult, ke kterému se má aplikace připojovat. WING se pozná podle sériového čísla, X32 a M32 podle názvu v síti a modelu. Dokud je mixpult vybraný, aplikace se k žádnému jinému nepřipojí." = "Vyberte mixpult, ku ktorému sa má aplikácia pripájať. WING sa rozpozná podľa sériového čísla, X32 a M32 podľa názvu v sieti a modelu. Kým je mixpult vybraný, aplikácia sa nepripojí k žiadnemu inému.";
+"Zadaná adresa má přednost před výběrem ze seznamu mixpultů na síti." = "Zadaná adresa má prednosť pred výberom zo zoznamu mixpultov v sieti.";
+"Automaticky – první nalezený" = "Automaticky – prvý nájdený";
+"Nenalezen v síti" = "Nenájdený v sieti";
+"Hledám mixpulty…" = "Hľadám mixpulty…";
+"Hledám vybraný mixpult „%@“…" = "Hľadám vybraný mixpult „%@“…";
+"Vybraný mixpult „%@“ není dostupný. Hledání se opakuje automaticky." = "Vybraný mixpult „%@“ nie je dostupný. Hľadanie sa opakuje automaticky.";
 "Není vybrána žádná sekce meter bridge." = "Nie je vybraná žiadna sekcia meter bridge.";
 "Adresa mixpultu není platná. Zadejte IPv4 adresu nebo název v síti, případně s portem (např. 192.168.1.20:10023)." = "Adresa mixpultu nie je platná. Zadajte IPv4 adresu alebo názov v sieti, prípadne s portom (napr. 192.168.1.20:10023).";
 "Připojeno: %@" = "Pripojené: %@";

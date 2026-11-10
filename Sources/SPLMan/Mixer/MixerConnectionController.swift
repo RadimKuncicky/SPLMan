@@ -64,10 +64,14 @@ final class MixerConnectionController {
 
     func configure(_ newSettings: MixerSettings, now: TimeInterval) {
         guard newSettings != settings || phase == .disabled else { return }
-        let kindChanged = newSettings.kind != settings.kind
+        // Names and connector counts belong to one console; retries to the same
+        // console keep them, but another console must not show them.
+        let consoleChanged = newSettings.kind != settings.kind
+            || newSettings.connectionAddress != settings.connectionAddress
+            || newSettings.connectionTarget != settings.connectionTarget
         settings = newSettings
         descriptors = newSettings.visibleSections
-        if kindChanged {
+        if consoleChanged {
             stripCounts = [:]
             names = [:]
         }
@@ -169,7 +173,11 @@ final class MixerConnectionController {
         attemptStartedAt = now
         connectedAt = nil
         phase = .connecting
-        driver.start(address: settings.connectionAddress, sections: descriptors)
+        driver.start(
+            address: settings.connectionAddress,
+            target: settings.connectionTarget,
+            sections: descriptors
+        )
     }
 
     private func scheduleRetry(now: TimeInterval) {

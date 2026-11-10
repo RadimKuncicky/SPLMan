@@ -7,10 +7,16 @@ enum MixerTests {
     private final class FakeDriver: MixerDriver {
         var update = MixerDriverUpdate(state: .connecting)
         var startedAddress: String??
+        var startedTarget: PreferredMixer??
         var stopCount = 0
 
-        func start(address: String?, sections: [MixerMeterSectionDescriptor]) {
+        func start(
+            address: String?,
+            target: PreferredMixer?,
+            sections: [MixerMeterSectionDescriptor]
+        ) {
             startedAddress = .some(address)
+            startedTarget = .some(target)
         }
 
         func poll() -> MixerDriverUpdate { update }
@@ -38,6 +44,13 @@ enum MixerTests {
         testUnknownDisplayMode(&failures)
         testConnection(&failures)
         testConnectionWithoutAttempt(&failures)
+        testPreferredMatching(&failures)
+        testPreferredSettings(&failures)
+        testScanList(&failures)
+        testConnectionTarget(&failures)
+        testConsoleSwitchClearsNames(&failures)
+        testWingDiscoveryTarget(&failures)
+        testX32ConsoleInfo(&failures)
         return failures
     }
 
@@ -920,6 +933,394 @@ enum MixerTests {
         let active: [MixerConnectionController.Phase] = [.connecting, .waitingToRetry]
         if !active.allSatisfy(\.isActive) || MixerConnectionController.Phase.disabled.isActive {
             failures.append("Mixer phases needing regular ticks are wrong")
+        }
+    }
+
+    private static func testPreferredMatching(_ failures: inout [String]) {
+        let wing = PreferredMixer(
+            kind: .behringerWing,
+            name: "FOH",
+            model: "wing-rack",
+            serial: "S1",
+            address: "10.0.0.5"
+        )
+        if !wing.matches(kind: .behringerWing, name: "Renamed", model: "wing", serial: " s1 ", address: "10.0.0.9") {
+            failures.append("A WING with the selected serial number was not recognized")
+        }
+        if wing.matches(kind: .behringerWing, name: "FOH", model: "wing-rack", serial: "S2", address: "10.0.0.5") {
+            failures.append("Another WING with the same name and address was taken for the selected one")
+        }
+
+        let wingWithoutSerial = PreferredMixer(kind: .behringerWing, name: "FOH", model: "wing-rack")
+        if !wingWithoutSerial.matches(kind: .behringerWing, name: "FOH", model: "wing-rack", serial: "S9", address: "10.0.0.7")
+            || wingWithoutSerial.matches(kind: .behringerWing, name: "MON", model: "wing-rack", serial: "S9", address: "10.0.0.7")
+            || wingWithoutSerial.matches(kind: .behringerWing, name: "FOH", model: "wing-compact", serial: "S9", address: "10.0.0.7") {
+            failures.append("A WING without a serial number was not recognized by name and model")
+        }
+
+        let x32 = PreferredMixer(kind: .behringerX32, name: "X32-FOH", model: "X32", address: "10.0.0.20")
+        if !x32.matches(kind: .behringerX32, name: "X32-FOH", model: "X32", serial: "", address: "10.0.0.33") {
+            failures.append("An X32 with the selected name and model was not recognized at another address")
+        }
+        if x32.matches(kind: .behringerX32, name: "X32-MON", model: "X32", serial: "", address: "10.0.0.20")
+            || x32.matches(kind: .behringerX32, name: "X32-FOH", model: "M32", serial: "", address: "10.0.0.20") {
+            failures.append("Another X32 at the selected address was taken for the selected one")
+        }
+
+        let x32WithoutName = PreferredMixer(kind: .behringerX32, model: "X32", address: "10.0.0.20")
+        if !x32WithoutName.matches(kind: .behringerX32, name: "", model: "X32", serial: "", address: " 10.0.0.20 ")
+            || x32WithoutName.matches(kind: .behringerX32, name: "", model: "X32", serial: "", address: "10.0.0.21") {
+            failures.append("An X32 without a network name was not recognized by its address")
+        }
+        if PreferredMixer(kind: .behringerX32).matches(
+            kind: .behringerX32,
+            name: "",
+            model: "",
+            serial: "",
+            address: ""
+        ) {
+            failures.append("A selection without anything to compare matched a console")
+        }
+
+        if wing.matches(kind: .behringerX32, name: "FOH", model: "wing-rack", serial: "S1", address: "10.0.0.5")
+            || x32.matches(kind: .behringerWing, name: "X32-FOH", model: "X32", serial: "", address: "10.0.0.20") {
+            failures.append("A console of another type was taken for the selected one")
+        }
+        let found = DiscoveredMixer(
+            kind: .behringerWing,
+            address: "10.0.0.9",
+            name: "Other",
+            model: "wing",
+            serial: "S1",
+            firmware: "3.1"
+        )
+        let selected = PreferredMixer(
+            kind: .behringerWing,
+            name: "Other",
+            model: "wing",
+            serial: "S1",
+            address: "10.0.0.9"
+        )
+        if !wing.matches(found) || PreferredMixer(found) != selected {
+            failures.append("A console found on the network was not selected correctly")
+        }
+    }
+
+    private static func testPreferredSettings(_ failures: inout [String]) {
+        var settings = MixerSettings()
+        settings.kind = .behringerWing
+        settings.preferredConsole = PreferredMixer(
+            kind: .behringerWing,
+            name: "FOH",
+            model: "wing-rack",
+            serial: "S1",
+            address: "10.0.0.5"
+        )
+        if settings.connectionTarget != settings.preferredConsole {
+            failures.append("The selected console was not used for discovery")
+        }
+        do {
+            let data = try PropertyListEncoder().encode(settings)
+            let decoded = try PropertyListDecoder().decode(MixerSettings.self, from: data)
+            if decoded != settings {
+                failures.append("The selected console did not survive encoding")
+            }
+
+            let older: [String: Any] = ["kind": MixerKind.behringerWing.rawValue, "address": ""]
+            let olderData = try PropertyListSerialization.data(
+                fromPropertyList: older,
+                format: .binary,
+                options: 0
+            )
+            let upgraded = try PropertyListDecoder().decode(MixerSettings.self, from: olderData)
+            if upgraded.preferredConsole != nil || upgraded.kind != .behringerWing {
+                failures.append("Settings from before console selection were not read")
+            }
+
+            guard var stored = try PropertyListSerialization.propertyList(
+                from: data,
+                format: nil
+            ) as? [String: Any], var preferred = stored["preferredConsole"] as? [String: Any] else {
+                failures.append("Console selection test could not inspect the property list")
+                return
+            }
+            preferred["kind"] = "consoleFromNewerVersion"
+            stored["preferredConsole"] = preferred
+            let unknownData = try PropertyListSerialization.data(
+                fromPropertyList: stored,
+                format: .binary,
+                options: 0
+            )
+            let unknown = try PropertyListDecoder().decode(MixerSettings.self, from: unknownData)
+            if unknown.preferredConsole != nil || unknown.kind != .behringerWing
+                || unknown.address != settings.address {
+                failures.append("An unknown selected console type was not dropped on its own")
+            }
+
+            preferred["kind"] = MixerKind.behringerX32.rawValue
+            preferred.removeValue(forKey: "serial")
+            stored["preferredConsole"] = preferred
+            let otherKindData = try PropertyListSerialization.data(
+                fromPropertyList: stored,
+                format: .binary,
+                options: 0
+            )
+            let otherKind = try PropertyListDecoder().decode(MixerSettings.self, from: otherKindData)
+            if otherKind.preferredConsole != nil {
+                failures.append("A selected console of another type than the console type was kept")
+            }
+
+            stored["kind"] = MixerKind.behringerX32.rawValue
+            let missingSerialData = try PropertyListSerialization.data(
+                fromPropertyList: stored,
+                format: .binary,
+                options: 0
+            )
+            let missingSerial = try PropertyListDecoder().decode(MixerSettings.self, from: missingSerialData)
+            if missingSerial.preferredConsole?.serial != ""
+                || missingSerial.preferredConsole?.name != "FOH" {
+                failures.append("A selected console without a serial number was not read")
+            }
+        } catch {
+            failures.append("Console selection failed to encode or decode: \(error)")
+        }
+
+        settings.address = "10.0.0.9"
+        if settings.connectionTarget != nil {
+            failures.append("An entered address did not take precedence over the selected console")
+        }
+        settings.address = ""
+        settings.kind = .behringerX32
+        if settings.connectionTarget != nil {
+            failures.append("A selected console of another type was used for discovery")
+        }
+    }
+
+    private static func testScanList(_ failures: inout [String]) {
+        func console(
+            _ kind: MixerKind,
+            _ address: String,
+            name: String,
+            serial: String = ""
+        ) -> DiscoveredMixer {
+            DiscoveredMixer(kind: kind, address: address, name: name, model: "m", serial: serial, firmware: "1")
+        }
+        var list = MixerScanList()
+        list.record(console(.behringerWing, "10.0.0.5", name: "FOH", serial: "S1"), now: 0)
+        list.record(console(.behringerWing, "10.0.0.6", name: "FOH", serial: "S1"), now: 1)
+        list.record(console(.behringerX32, "10.0.0.20", name: "X32-MON"), now: 2)
+        list.record(console(.behringerX32, "10.0.0.20", name: "X32-MON"), now: 3)
+        list.record(console(.behringerX32, "10.0.0.21", name: "X32-MON"), now: 3)
+        let found = list.consoles
+        if found.count != 3 || found.filter({ $0.kind == .behringerWing }).count != 1 {
+            failures.append("Repeated scan replies were not merged per console")
+        }
+        if found.first?.kind != .behringerWing || found.first?.address != "10.0.0.6" {
+            failures.append("A WING that changed its address was not updated")
+        }
+
+        list.prune(now: 1 + MixerScanList.lifetime - 0.1)
+        if list.consoles.count != 3 {
+            failures.append("A console that answered lately was dropped")
+        }
+        list.prune(now: 1 + MixerScanList.lifetime)
+        if list.consoles.map(\.address) != ["10.0.0.20", "10.0.0.21"] {
+            failures.append("A console that stopped answering was not dropped")
+        }
+        list.prune(now: 3 + MixerScanList.lifetime)
+        if !list.consoles.isEmpty {
+            failures.append("Consoles that stopped answering stayed in the list")
+        }
+
+        for index in 0..<(MixerScanList.maximumConsoles + 5) {
+            list.record(console(.behringerX32, "10.1.0.\(index)", name: "X"), now: 100)
+        }
+        if list.consoles.count != MixerScanList.maximumConsoles {
+            failures.append("The list of found consoles was not limited")
+        }
+    }
+
+    private static func testConnectionTarget(_ failures: inout [String]) {
+        var drivers: [FakeDriver] = []
+        let timing = MixerConnectionController.Timing()
+        let controller = MixerConnectionController(timing: timing) { kind in
+            guard kind != .none else { return nil }
+            let driver = FakeDriver()
+            drivers.append(driver)
+            return driver
+        }
+        let target = PreferredMixer(kind: .behringerX32, name: "X32-FOH", model: "X32", address: "10.0.0.20")
+        var settings = MixerSettings()
+        settings.kind = .behringerX32
+        settings.preferredConsole = target
+
+        controller.configure(settings, now: 0)
+        if drivers.last?.startedAddress != .some(nil) || drivers.last?.startedTarget != .some(target) {
+            failures.append("Discovery was not limited to the selected console")
+        }
+        drivers.last?.update = MixerDriverUpdate(state: .failed)
+        controller.tick(now: 1)
+        controller.tick(now: 1 + timing.retryDelay)
+        if controller.phase != .connecting || drivers.count != 2
+            || drivers.last?.startedTarget != .some(target) {
+            failures.append("A selected console that was not found was not searched for again")
+        }
+
+        settings.address = "10.0.0.9"
+        controller.configure(settings, now: 10)
+        if drivers.last?.startedAddress != .some("10.0.0.9") || drivers.last?.startedTarget != .some(nil) {
+            failures.append("An entered address did not take precedence over the selected console")
+        }
+
+        let connected = MixerConnectionController.Phase.connected(MixerIdentity(
+            address: "10.0.0.20",
+            name: "X32-FOH",
+            model: "X32",
+            firmware: "4"
+        ))
+        if MixerBridgeNotice.text(for: .waitingToRetry, target: target)?.contains("X32-FOH") != true
+            || MixerBridgeNotice.text(for: .connecting, target: target)?.contains("X32-FOH") != true
+            || MixerBridgeNotice.text(for: .waitingToRetry) != nil
+            || MixerBridgeNotice.text(for: connected, target: target) != nil {
+            failures.append("The meter bridge did not name the selected console it waits for")
+        }
+    }
+
+    private static func testConsoleSwitchClearsNames(_ failures: inout [String]) {
+        var drivers: [FakeDriver] = []
+        let controller = MixerConnectionController { kind in
+            guard kind != .none else { return nil }
+            let driver = FakeDriver()
+            drivers.append(driver)
+            return driver
+        }
+        var settings = MixerSettings()
+        settings.kind = .behringerWing
+        settings.preferredConsole = PreferredMixer(kind: .behringerWing, name: "FOH", model: "wing", serial: "S1")
+        controller.configure(settings, now: 0)
+        drivers.last?.update = MixerDriverUpdate(
+            state: .connected(MixerIdentity(address: "10.0.0.5", name: "FOH", model: "wing", firmware: "3")),
+            secondsSinceMeterData: 0.02,
+            stripCounts: ["in.LCL": 2],
+            names: ["ch": [0: "Kick"]]
+        )
+        controller.tick(now: 0)
+        func channelName() -> String? {
+            controller.sections.first(where: { $0.id == "ch" })?.strips.first?.name
+        }
+        func connectorCount() -> Int? {
+            controller.sections.first(where: { $0.id == "in.LCL" })?.strips.count
+        }
+        if channelName() != "Kick" || connectorCount() != 2 {
+            failures.append("Console switch test did not apply the first console's names")
+            return
+        }
+
+        if let dca = settings.kind.sections.first(where: { $0.id == "dca" }) {
+            settings.setVisible(dca, false)
+        }
+        controller.configure(settings, now: 1)
+        if channelName() != "Kick" || connectorCount() != 2 {
+            failures.append("Changing the sections of the same console lost its names")
+        }
+
+        settings.preferredConsole = PreferredMixer(kind: .behringerWing, name: "MON", model: "wing", serial: "S2")
+        controller.configure(settings, now: 2)
+        if channelName() != "" || connectorCount() != 0 {
+            failures.append("Names of the previous console stayed after selecting another console")
+        }
+
+        drivers.last?.update = MixerDriverUpdate(
+            state: .connected(MixerIdentity(address: "10.0.0.7", name: "MON", model: "wing", firmware: "3")),
+            secondsSinceMeterData: 0.02,
+            names: ["ch": [0: "Vox"]]
+        )
+        controller.tick(now: 2)
+        settings.address = "10.0.0.9"
+        controller.configure(settings, now: 3)
+        if channelName() != "" {
+            failures.append("Names of the previous console stayed after entering another address")
+        }
+    }
+
+    private static func testWingDiscoveryTarget(_ failures: inout [String]) {
+        let replies = [
+            "WING,10.0.0.7,MON,wing-compact,S2,3.1",
+            "WING,10.0.0.5,FOH,wing-rack,S1,3.1"
+        ].compactMap { WingConsoleInfo(discoveryReply: $0) }
+        guard replies.count == 2 else {
+            failures.append("WING discovery target test replies were not read")
+            return
+        }
+        if WingMixerDriver.discoveryFilter(for: nil) != nil {
+            failures.append("WING discovery without a selected console must take the first reply")
+        }
+        let target = PreferredMixer(kind: .behringerWing, name: "FOH", model: "wing-rack", serial: "S1")
+        guard let filter = WingMixerDriver.discoveryFilter(for: target) else {
+            failures.append("WING discovery did not use the selected console")
+            return
+        }
+        if replies.first(where: filter)?.serial != "S1" {
+            failures.append("WING discovery connected to another console that answered first")
+        }
+        if filter(replies[0]) {
+            failures.append("WING discovery accepted a console other than the selected one")
+        }
+        let x32Target = PreferredMixer(kind: .behringerX32, name: "FOH", model: "wing-rack")
+        if let x32Filter = WingMixerDriver.discoveryFilter(for: x32Target),
+           replies.contains(where: x32Filter) {
+            failures.append("WING discovery accepted a console selected as another type")
+        }
+    }
+
+    private static func testX32ConsoleInfo(_ failures: inout [String]) {
+        if X32Protocol.xinfoRequest != Array("/xinfo\0\0,\0\0\0".utf8) {
+            failures.append("X32 xinfo request is not a read without arguments")
+        }
+        let reply = "/xinfo\0\0,ssss\0\0\0" + "192.168.0.64\0\0\0\0" + "X32-02-4A-53\0\0\0\0"
+            + "X32C\0\0\0\0" + "2.10\0\0\0\0"
+        guard let message = X32Message(packet: Array(reply.utf8)),
+              let info = X32ConsoleInfo(message: message) else {
+            failures.append("X32 xinfo reply was not read")
+            return
+        }
+        let expected = X32ConsoleInfo(
+            ip: "192.168.0.64",
+            name: "X32-02-4A-53",
+            model: "X32C",
+            firmware: "2.10"
+        )
+        if info != expected {
+            failures.append("X32 xinfo reply fields were read incorrectly")
+        }
+        let infoReply = "/info\0\0\0,ssss\0\0\0V2.05\0\0\0osc-server\0\0X32\0" + "2.12\0\0\0\0"
+        if let other = X32Message(packet: Array(infoReply.utf8)), X32ConsoleInfo(message: other) != nil {
+            failures.append("An X32 info reply was taken for an xinfo reply")
+        }
+        let short = "/xinfo\0\0,ss\0" + "192.168.0.64\0\0\0\0" + "X32\0"
+        if let message = X32Message(packet: Array(short.utf8)), X32ConsoleInfo(message: message) != nil {
+            failures.append("An incomplete X32 xinfo reply was accepted")
+        }
+
+        if X32MixerDriver.discoveryFilter(for: nil) != nil {
+            failures.append("X32 discovery without a selected console must take the first reply")
+        }
+        let target = PreferredMixer(kind: .behringerX32, name: "X32-02-4A-53", model: "X32C")
+        guard let filter = X32MixerDriver.discoveryFilter(for: target) else {
+            failures.append("X32 discovery did not use the selected console")
+            return
+        }
+        let other = X32ConsoleInfo(ip: "192.168.0.65", name: "X32-MON", model: "X32C", firmware: "2.10")
+        if filter(other, "192.168.0.65") || !filter(info, "192.168.0.64") {
+            failures.append("X32 discovery did not select the selected console by name and model")
+        }
+        let byAddress = PreferredMixer(kind: .behringerX32, model: "X32C", address: "192.168.0.64")
+        guard let addressFilter = X32MixerDriver.discoveryFilter(for: byAddress) else {
+            failures.append("X32 discovery did not use a selected console without a name")
+            return
+        }
+        if !addressFilter(info, "192.168.0.64") || addressFilter(other, "192.168.0.65") {
+            failures.append("X32 discovery did not select a console without a name by its sender")
         }
     }
 }

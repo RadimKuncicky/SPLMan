@@ -46,6 +46,8 @@ public final class WingClient {
     private let meterGroups: [WingMeterGroup]
     private let nameNodes: [Int32]
     private let nameNodeSet: Set<Int32>
+    /// Nil to connect to the first console that answers discovery.
+    private let discoveryFilter: ((WingConsoleInfo) -> Bool)?
 
     private var state = State.connecting
     private var address: String?
@@ -75,10 +77,20 @@ public final class WingClient {
     ///   - address: The console's address, or nil to find it by broadcast.
     ///   - meterGroups: The values of each group are kept apart in `Snapshot.reports`.
     ///   - nameNodes: Text parameters to read and keep current.
-    public init(address: String?, meterGroups: [WingMeterGroup], nameNodes: [Int32]) {
+    ///   - discoveryFilter: Without an address, only a console whose discovery
+    ///     reply it accepts is connected; replies of other consoles are ignored
+    ///     and the attempt fails if no accepted console answers. Called on the
+    ///     client's queue. Ignored when an address is given.
+    public init(
+        address: String?,
+        meterGroups: [WingMeterGroup],
+        nameNodes: [Int32],
+        discoveryFilter: ((WingConsoleInfo) -> Bool)? = nil
+    ) {
         self.address = address
         self.meterGroups = meterGroups
         self.nameNodes = nameNodes
+        self.discoveryFilter = address == nil ? discoveryFilter : nil
         nameNodeSet = Set(nameNodes)
         reports = Array(repeating: [], count: meterGroups.count)
         measurement = WingGroupMeasurement(groups: meterGroups)
@@ -193,7 +205,7 @@ public final class WingClient {
             return
         }
         guard discoveriesSent < Self.discoveryAttempts else {
-            fail("no discovery reply")
+            fail(discoveryFilter == nil ? "no discovery reply" : "no reply from the selected console")
             return
         }
         discoveriesSent += 1
@@ -207,6 +219,11 @@ public final class WingClient {
                 discoveryReply: String(decoding: datagram, as: UTF8.self)
             ) else { return }
             if connection == nil, address == nil {
+                // Another console may answer first; only the selected one is used.
+                if let discoveryFilter, !discoveryFilter(info) {
+                    ignoredDatagrams += 1
+                    return
+                }
                 console = info
                 address = info.ip
                 filter = WingConsoleFilter(address: info.ip)

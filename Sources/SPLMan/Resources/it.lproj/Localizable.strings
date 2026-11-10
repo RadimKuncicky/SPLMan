@@ -216,6 +216,14 @@
 "Mixpult není nastaven." = "Nessun mixer configurato.";
 "Hledám mixpult…" = "Ricerca del mixer…";
 "Mixpult není dostupný. Připojení se opakuje automaticky." = "Il mixer non è disponibile. La connessione viene ritentata automaticamente.";
+"Mixpulty na síti" = "Mixer in rete";
+"Vyberte mixpult, ke kterému se má aplikace připojovat. WING se pozná podle sériového čísla, X32 a M32 podle názvu v síti a modelu. Dokud je mixpult vybraný, aplikace se k žádnému jinému nepřipojí." = "Scegli il mixer a cui si collega l’app. Un WING viene riconosciuto dal numero di serie, un X32 o M32 dal nome di rete e dal modello. Finché un mixer è selezionato, l’app non si collega a nessun altro.";
+"Zadaná adresa má přednost před výběrem ze seznamu mixpultů na síti." = "Un indirizzo inserito ha la precedenza sul mixer scelto dall’elenco della rete.";
+"Automaticky – první nalezený" = "Automatico – il primo trovato";
+"Nenalezen v síti" = "Non trovato in rete";
+"Hledám mixpulty…" = "Ricerca dei mixer…";
+"Hledám vybraný mixpult „%@“…" = "Ricerca del mixer selezionato «%@»…";
+"Vybraný mixpult „%@“ není dostupný. Hledání se opakuje automaticky." = "Il mixer selezionato «%@» non è disponibile. La ricerca viene ripetuta automaticamente.";
 "Není vybrána žádná sekce meter bridge." = "Nessuna sezione del meter bridge selezionata.";
 "Adresa mixpultu není platná. Zadejte IPv4 adresu nebo název v síti, případně s portem (např. 192.168.1.20:10023)." = "L’indirizzo del mixer non è valido. Inserisci un indirizzo IPv4 o un nome di rete, eventualmente con la porta (ad es. 192.168.1.20:10023).";
 "Připojeno: %@" = "Connesso: %@";

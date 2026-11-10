@@ -58,10 +58,141 @@ struct MixerMeterSectionDescriptor: Identifiable, Equatable {
     let isVisibleByDefault: Bool
 }
 
+/// The console the user chose from the consoles found on the network. While it
+/// is selected, the application connects to no other console.
+struct PreferredMixer: Codable, Equatable {
+    var kind: MixerKind
+    var name: String
+    var model: String
+    /// Empty for consoles that do not report one, such as the X32.
+    var serial: String
+    /// The address it was last found at.
+    var address: String
+
+    private enum CodingKeys: String, CodingKey {
+        case kind
+        case name
+        case model
+        case serial
+        case address
+    }
+
+    init(
+        kind: MixerKind,
+        name: String = "",
+        model: String = "",
+        serial: String = "",
+        address: String = ""
+    ) {
+        self.kind = kind
+        self.name = name
+        self.model = model
+        self.serial = serial
+        self.address = address
+    }
+
+    init(_ console: DiscoveredMixer) {
+        self.init(
+            kind: console.kind,
+            name: console.name,
+            model: console.model,
+            serial: console.serial,
+            address: console.address
+        )
+    }
+
+    /// An unknown console type, for example from a newer version, fails, so
+    /// only the preference is dropped.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try container.decode(MixerKind.self, forKey: .kind)
+        guard kind != .none else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kind,
+                in: container,
+                debugDescription: "A preferred console needs a console type"
+            )
+        }
+        name = (try? container.decodeIfPresent(String.self, forKey: .name)) ?? ""
+        model = (try? container.decodeIfPresent(String.self, forKey: .model)) ?? ""
+        serial = (try? container.decodeIfPresent(String.self, forKey: .serial)) ?? ""
+        address = (try? container.decodeIfPresent(String.self, forKey: .address)) ?? ""
+    }
+
+    /// The name shown to the user.
+    var displayName: String {
+        for text in [name, model, address] {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        return kind.title
+    }
+
+    /// Whether a console that answered discovery is this one. A WING is
+    /// recognized by its serial number; an X32 or M32, which reports none, by its
+    /// network name and model. Only without those is the last address compared,
+    /// so a console that got another address is still found.
+    func matches(
+        kind: MixerKind,
+        name: String,
+        model: String,
+        serial: String,
+        address: String
+    ) -> Bool {
+        guard kind == self.kind, kind != .none else { return false }
+        let ownSerial = Self.trimmed(self.serial)
+        if !ownSerial.isEmpty {
+            return ownSerial.caseInsensitiveCompare(Self.trimmed(serial)) == .orderedSame
+        }
+        let ownName = Self.trimmed(self.name)
+        if !ownName.isEmpty {
+            return ownName == Self.trimmed(name)
+                && Self.trimmed(self.model).caseInsensitiveCompare(Self.trimmed(model)) == .orderedSame
+        }
+        let ownAddress = Self.trimmed(self.address)
+        return !ownAddress.isEmpty && ownAddress == Self.trimmed(address)
+    }
+
+    func matches(_ console: DiscoveredMixer) -> Bool {
+        matches(
+            kind: console.kind,
+            name: console.name,
+            model: console.model,
+            serial: console.serial,
+            address: console.address
+        )
+    }
+
+    private static func trimmed(_ text: String) -> String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+/// A console that answered a network scan.
+struct DiscoveredMixer: Equatable, Identifiable {
+    var kind: MixerKind
+    var address: String
+    var name: String
+    var model: String
+    var serial: String
+    var firmware: String
+
+    /// One entry per console: a WING answers with its serial number, which stays
+    /// the same when its address changes; other consoles are told apart by address.
+    var id: String {
+        let key = serial.trimmingCharacters(in: .whitespacesAndNewlines)
+        return kind.rawValue + "|" + (key.isEmpty ? address : key)
+    }
+}
+
 struct MixerSettings: Codable, Equatable {
     var kind: MixerKind = .none
-    /// Empty means the console is found automatically on the network.
+    /// Empty means the console is found automatically on the network. An
+    /// address takes precedence over `preferredConsole`.
     var address = ""
+    /// The console chosen from the network, always of type `kind`. Nil connects
+    /// to the first console found.
+    var preferredConsole: PreferredMixer?
     /// Only the choices the user changed, by `MixerKind.rawValue` and section
     /// identifier; other sections keep their default. Consoles share section
     /// identifiers such as `ch`, so each console type keeps its own choices.
@@ -71,6 +202,7 @@ struct MixerSettings: Codable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case kind
         case address
+        case preferredConsole
         case sectionVisibilityByKind
         // The choices of the current console type, for versions before
         // `sectionVisibilityByKind`.
@@ -83,6 +215,14 @@ struct MixerSettings: Codable, Equatable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         kind = (try? container.decodeIfPresent(MixerKind.self, forKey: .kind)) ?? .none
         address = (try? container.decodeIfPresent(String.self, forKey: .address)) ?? ""
+        // Missing before console selection, and unreadable or of another type
+        // only drops the selection.
+        if let preferred = try? container.decodeIfPresent(
+            PreferredMixer.self,
+            forKey: .preferredConsole
+        ), preferred.kind == kind {
+            preferredConsole = preferred
+        }
         if let byKind = try? container.decodeIfPresent(
             [String: [String: Bool]].self,
             forKey: .sectionVisibilityByKind
@@ -102,6 +242,7 @@ struct MixerSettings: Codable, Equatable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(kind, forKey: .kind)
         try container.encode(address, forKey: .address)
+        try container.encodeIfPresent(preferredConsole, forKey: .preferredConsole)
         try container.encode(sectionVisibilityByKind, forKey: .sectionVisibilityByKind)
         try container.encode(
             sectionVisibilityByKind[kind.rawValue] ?? [:],
@@ -126,6 +267,15 @@ struct MixerSettings: Codable, Equatable {
     var connectionAddress: String? {
         let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// The only console discovery may connect to: the selected one, unless an
+    /// address is entered, which takes precedence.
+    var connectionTarget: PreferredMixer? {
+        guard connectionAddress == nil,
+              let preferredConsole,
+              preferredConsole.kind == kind else { return nil }
+        return preferredConsole
     }
 }
 
@@ -157,7 +307,15 @@ struct MixerDriverUpdate {
 /// One connection attempt to one console. Every method returns immediately and
 /// nothing may change the console's state: this feature only ever reads meters.
 protocol MixerDriver: AnyObject {
-    func start(address: String?, sections: [MixerMeterSectionDescriptor])
+    /// - Parameters:
+    ///   - address: The console's address, or nil for discovery.
+    ///   - target: With discovery, the only console that may be connected;
+    ///     nil connects to the first console found.
+    func start(
+        address: String?,
+        target: PreferredMixer?,
+        sections: [MixerMeterSectionDescriptor]
+    )
     func poll() -> MixerDriverUpdate
     func stop()
 }

@@ -216,6 +216,14 @@
 "Mixpult není nastaven." = "Nenhuma mesa configurada.";
 "Hledám mixpult…" = "Procurando a mesa…";
 "Mixpult není dostupný. Připojení se opakuje automaticky." = "A mesa não está disponível. A conexão é repetida automaticamente.";
+"Mixpulty na síti" = "Mesas na rede";
+"Vyberte mixpult, ke kterému se má aplikace připojovat. WING se pozná podle sériového čísla, X32 a M32 podle názvu v síti a modelu. Dokud je mixpult vybraný, aplikace se k žádnému jinému nepřipojí." = "Escolha a mesa à qual o app se conecta. Uma WING é reconhecida pelo número de série, e uma X32 ou M32 pelo nome de rede e modelo. Enquanto uma mesa estiver selecionada, o app não se conecta a nenhuma outra.";
+"Zadaná adresa má přednost před výběrem ze seznamu mixpultů na síti." = "Um endereço informado tem prioridade sobre a mesa escolhida na lista da rede.";
+"Automaticky – první nalezený" = "Automático – a primeira encontrada";
+"Nenalezen v síti" = "Não encontrada na rede";
+"Hledám mixpulty…" = "Procurando mesas…";
+"Hledám vybraný mixpult „%@“…" = "Procurando a mesa selecionada “%@”…";
+"Vybraný mixpult „%@“ není dostupný. Hledání se opakuje automaticky." = "A mesa selecionada “%@” não está disponível. A busca é repetida automaticamente.";
 "Není vybrána žádná sekce meter bridge." = "Nenhuma seção do meter bridge selecionada.";
 "Adresa mixpultu není platná. Zadejte IPv4 adresu nebo název v síti, případně s portem (např. 192.168.1.20:10023)." = "O endereço da mesa não é válido. Informe um endereço IPv4 ou um nome de rede, opcionalmente com a porta (por exemplo, 192.168.1.20:10023).";
 "Připojeno: %@" = "Conectada: %@";

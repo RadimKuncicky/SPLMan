@@ -46,6 +46,9 @@ struct SettingsView: View {
     @AppStorage("SettingsView.selectedSection") private var selection: SettingsSection = .input
     @State private var draggedMetric: Metric?
     @State private var isAnalysisNotesPresented = false
+    /// Bumped when a console is chosen from the list, which must win over an
+    /// address still being typed.
+    @State private var mixerAddressDiscardRevision = 0
 
     private static let instantMetrics: [Metric] = [.aSlow, .cSlow, .lafMax, .lcPeak]
     private static let oneSecondMetrics: [Metric] = [
@@ -537,32 +540,22 @@ struct SettingsView: View {
 
     private var mixerSection: some View {
         HStack(alignment: .top, spacing: 16) {
-            settingsGroup(L10n.text("Připojení mixpultu")) {
-                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
-                    settingRow(L10n.text("Typ")) {
-                        Picker(L10n.text("Typ"), selection: mixerKindBinding) {
-                            ForEach(MixerKind.allCases) { kind in
-                                Text(kind.title).tag(kind)
-                            }
+            VStack(alignment: .leading, spacing: 16) {
+                mixerConnectionGroup
+                settingsGroup(L10n.text("Mixpulty na síti")) {
+                    MixerConsoleList(
+                        scanner: model.mixerScanner,
+                        settings: model.settings.mixer,
+                        select: { console in
+                            model.selectMixerConsole(console)
+                            mixerAddressDiscardRevision += 1
+                        },
+                        selectAutomatic: {
+                            model.clearMixerConsoleSelection()
+                            mixerAddressDiscardRevision += 1
                         }
-                        .labelsHidden()
-                        .fixedSize()
-                    }
-                    if model.settings.mixer.kind != .none {
-                        settingRow(L10n.text("Adresa")) {
-                            MixerAddressField(
-                                address: model.settings.mixer.address,
-                                commit: model.setMixerAddress
-                            )
-                            .frame(maxWidth: 220)
-                        }
-                    }
-                }
-
-                MixerStatusLine(bridge: model.mixerBridge)
-
-                if model.settings.mixer.kind != .none {
-                    caption(L10n.text("Prázdná adresa znamená automatické vyhledání v síti. Pokud se mixpult nenajde, zadejte jeho IP adresu a v Nastavení systému povolte přístup k místní síti."))
+                    )
+                    caption(L10n.text("Vyberte mixpult, ke kterému se má aplikace připojovat. WING se pozná podle sériového čísla, X32 a M32 podle názvu v síti a modelu. Dokud je mixpult vybraný, aplikace se k žádnému jinému nepřipojí."))
                 }
             }
 
@@ -581,6 +574,44 @@ struct SettingsView: View {
                                 .lineLimit(1)
                         }
                     }
+                }
+            }
+        }
+        // The network is scanned only while this page is shown.
+        .onAppear { model.mixerScanner.start() }
+        .onDisappear { model.mixerScanner.stop() }
+    }
+
+    private var mixerConnectionGroup: some View {
+        settingsGroup(L10n.text("Připojení mixpultu")) {
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+                settingRow(L10n.text("Typ")) {
+                    Picker(L10n.text("Typ"), selection: mixerKindBinding) {
+                        ForEach(MixerKind.allCases) { kind in
+                            Text(kind.title).tag(kind)
+                        }
+                    }
+                    .labelsHidden()
+                    .fixedSize()
+                }
+                if model.settings.mixer.kind != .none {
+                    settingRow(L10n.text("Adresa")) {
+                        MixerAddressField(
+                            address: model.settings.mixer.address,
+                            commit: model.setMixerAddress,
+                            discardRevision: mixerAddressDiscardRevision
+                        )
+                        .frame(maxWidth: 220)
+                    }
+                }
+            }
+
+            MixerStatusLine(bridge: model.mixerBridge)
+
+            if model.settings.mixer.kind != .none {
+                caption(L10n.text("Prázdná adresa znamená automatické vyhledání v síti. Pokud se mixpult nenajde, zadejte jeho IP adresu a v Nastavení systému povolte přístup k místní síti."))
+                if model.settings.mixer.connectionAddress != nil {
+                    caption(L10n.text("Zadaná adresa má přednost před výběrem ze seznamu mixpultů na síti."))
                 }
             }
         }
@@ -962,6 +993,9 @@ struct SettingsView: View {
 private struct MixerAddressField: View {
     let address: String
     let commit: (String) -> Void
+    /// A change drops an uncommitted draft for the stored address, so it is
+    /// not committed later, for example when focus leaves the field.
+    var discardRevision = 0
 
     @State private var draft = ""
     @FocusState private var isFocused: Bool
@@ -977,6 +1011,9 @@ private struct MixerAddressField: View {
             }
             .onChange(of: address) { newValue in
                 if !isFocused { draft = newValue }
+            }
+            .onChange(of: discardRevision) { _ in
+                draft = address
             }
             .onDisappear { commit(draft) }
     }
@@ -1017,14 +1054,147 @@ private struct MixerStatusLine: View {
         case .invalidAddress:
             return MixerBridgeNotice.invalidAddress
         case .connecting:
+            if let target = bridge.target {
+                return MixerBridgeNotice.searching(for: target)
+            }
             return L10n.text("Hledám mixpult…")
         case .waitingToRetry:
+            if let target = bridge.target {
+                return MixerBridgeNotice.unavailable(target)
+            }
             return L10n.text("Mixpult není dostupný. Připojení se opakuje automaticky.")
         case .connected(let identity):
             let description = identity.name.isEmpty
                 ? identity.address
                 : "\(identity.name) (\(identity.address))"
             return L10n.format("Připojeno: %@", description)
+        }
+    }
+}
+
+/// Every console found on the network, of every supported type, to choose the
+/// one the application connects to.
+private struct MixerConsoleList: View {
+    @ObservedObject var scanner: MixerScanner
+    let settings: MixerSettings
+    let select: (DiscoveredMixer) -> Void
+    let selectAutomatic: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if settings.kind != .none {
+                row(isSelected: usesList && settings.preferredConsole == nil, action: selectAutomatic) {
+                    Text(L10n.text("Automaticky – první nalezený"))
+                        .lineLimit(1)
+                }
+            }
+            if let preferred = settings.preferredConsole,
+               !scanner.consoles.contains(where: { preferred.matches($0) }) {
+                // Not a button: there is nothing to connect to until it is found.
+                rowContent(isSelected: usesList) {
+                    label(
+                        kind: preferred.kind,
+                        name: preferred.name,
+                        model: preferred.model,
+                        address: preferred.address,
+                        serial: preferred.serial
+                    )
+                    Text(L10n.text("Nenalezen v síti"))
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                        .lineLimit(1)
+                }
+            }
+            ForEach(scanner.consoles) { console in
+                row(
+                    isSelected: usesList && settings.preferredConsole?.matches(console) == true,
+                    action: { select(console) }
+                ) {
+                    label(
+                        kind: console.kind,
+                        name: console.name,
+                        model: console.model,
+                        address: console.address,
+                        serial: console.serial
+                    )
+                }
+            }
+            if scanner.consoles.isEmpty {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text(L10n.text("Hledám mixpulty…"))
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+            }
+        }
+    }
+
+    /// An entered address takes precedence over the list, so nothing in it is
+    /// marked as in use.
+    private var usesList: Bool { settings.connectionAddress == nil }
+
+    private func row<Content: View>(
+        isSelected: Bool,
+        action: @escaping () -> Void,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        let rowView = rowContent(isSelected: isSelected, content: content)
+        return Button(action: action) {
+            rowView
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private func rowContent<Content: View>(
+        isSelected: Bool,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                .frame(width: 18)
+            content()
+            Spacer(minLength: 4)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 7)
+                .fill(isSelected ? Color.accentColor.opacity(0.18) : Color.clear)
+        )
+        .contentShape(Rectangle())
+    }
+
+    /// The name, or what identifies a console without one, then the rest.
+    private func label(
+        kind: MixerKind,
+        name: String,
+        model: String,
+        address: String,
+        serial: String
+    ) -> some View {
+        let candidates = [name, model, address].map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let title = candidates.first(where: { !$0.isEmpty }) ?? kind.title
+        var parts = [kind.title] + candidates.dropFirst().filter { !$0.isEmpty && $0 != title }
+        let trimmedSerial = serial.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedSerial.isEmpty { parts.append("S/N \(trimmedSerial)") }
+        let detail = parts.filter { $0 != title }.joined(separator: " · ")
+        return HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(verbatim: title)
+                .lineLimit(1)
+            Text(verbatim: detail)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
         }
     }
 }

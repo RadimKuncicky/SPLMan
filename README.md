@@ -96,7 +96,14 @@ structured so that other consoles can be added as further drivers.
 
 Under **Mixing console** in Settings, select the console type. Leave the address
 empty to find the console on the network automatically, or enter its IP address
-if it is on another network or automatic discovery does not find it. Then select
+if it is on another network or automatic discovery does not find it. While this
+page is open, SPL Man lists every WING, X32 and M32 that answers on the network;
+choosing one sets the console type and makes SPL Man connect only to that
+console (a WING is recognized by its serial number, an X32 or M32 by its network
+name and model). If the chosen console is not on the network, SPL Man keeps
+looking for it and does not connect to any other console. **Automatic – first
+one found** connects to the first console that answers, and an entered address
+takes precedence over the list. Then select
 **Meter bridge** in the analysis section or with the analysis button on the
 display. The console connection only reads data and never changes the console.
 

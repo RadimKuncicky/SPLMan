@@ -7,6 +7,9 @@ import Foundation
 final class MixerBridgeModel: ObservableObject {
     @Published private(set) var phase: MixerConnectionController.Phase = .disabled
     @Published private(set) var sections: [MixerBridgeSection] = []
+    /// The selected console that discovery waits for, nil when any console
+    /// found, or the entered address, is used.
+    @Published private(set) var target: PreferredMixer?
 
     let levels = MixerLevelStore()
 
@@ -17,11 +20,14 @@ final class MixerBridgeModel: ObservableObject {
     private var timer: DispatchSourceTimer?
     private var publishedPhase: MixerConnectionController.Phase = .disabled
     private var publishedSections: [MixerBridgeSection] = []
+    private var currentTarget: PreferredMixer?
+    private var publishedTarget: PreferredMixer?
 
     func apply(_ settings: MixerSettings) {
         queue.async { [weak self] in
             guard let self else { return }
             self.controller.configure(settings, now: Self.now)
+            self.currentTarget = settings.connectionTarget
             if self.controller.phase.isActive {
                 self.startTimer()
             } else {
@@ -67,12 +73,17 @@ final class MixerBridgeModel: ObservableObject {
         levels.replace(controller.levels)
         let phase = controller.phase
         let sections = controller.sections
-        guard phase != publishedPhase || sections != publishedSections else { return }
+        let target = currentTarget
+        guard phase != publishedPhase
+            || sections != publishedSections
+            || target != publishedTarget else { return }
         publishedPhase = phase
         publishedSections = sections
+        publishedTarget = target
         DispatchQueue.main.async { [weak self] in
             self?.phase = phase
             self?.sections = sections
+            self?.target = target
         }
     }
 }

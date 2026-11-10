@@ -16,6 +16,8 @@ public final class X32Client {
     public struct Snapshot {
         public let state: State
         public let address: String?
+        /// The console's network name, empty until its `/xinfo` reply arrives.
+        public let name: String
         public let model: String
         public let firmware: String
         /// Age of the most recent meter page, nil until the first one arrives.
@@ -46,11 +48,14 @@ public final class X32Client {
     private let meterPages: [Int]
     private let nameAddresses: [String]
     private let nameAddressSet: Set<String>
+    /// Nil to use the first console that answers discovery.
+    private let discoveryFilter: ((X32ConsoleInfo, String) -> Bool)?
 
     private var state = State.connecting
     /// The configured console's IPv4 address once it is known.
     private var destination: in_addr?
     private var console: in_addr?
+    private var name = ""
     private var model = ""
     private var firmware = ""
     private var meterPageReceivedAt: [Int: TimeInterval] = [:]
@@ -71,13 +76,24 @@ public final class X32Client {
     ///     `:port` (see `X32Endpoint`), or nil to find it by broadcast.
     ///   - meterPages: The `/meters/<page>` pages to receive.
     ///   - nameAddresses: Text parameters to read and keep current.
-    public init(address: String?, meterPages: [Int], nameAddresses: [String]) {
+    ///   - discoveryFilter: Without an address, discovery asks for `/xinfo`
+    ///     and only a console whose reply it accepts, given with the reply's
+    ///     sender address, is used; other consoles are ignored and the attempt
+    ///     fails if no accepted console answers. Called on the client's queue.
+    ///     Ignored when an address is given.
+    public init(
+        address: String?,
+        meterPages: [Int],
+        nameAddresses: [String],
+        discoveryFilter: ((_ info: X32ConsoleInfo, _ sender: String) -> Bool)? = nil
+    ) {
         configuredAddress = address
         endpoint = address.flatMap(X32Endpoint.init(parsing:))
         consolePort = endpoint?.port ?? X32Protocol.port
         self.meterPages = meterPages
         self.nameAddresses = nameAddresses
         nameAddressSet = Set(nameAddresses)
+        self.discoveryFilter = address == nil ? discoveryFilter : nil
     }
 
     deinit { tearDown() }
@@ -99,6 +115,7 @@ public final class X32Client {
             return Snapshot(
                 state: state,
                 address: console.map(ConsoleUDPSocket.text(of:)) ?? configuredAddress,
+                name: name,
                 model: model,
                 firmware: firmware,
                 secondsSinceMeterData: pageAges.values.min(),
@@ -232,6 +249,8 @@ public final class X32Client {
         if endpoint != nil {
             guard let destination else { return }
             socket?.send(X32Protocol.infoRequest, to: destination, port: consolePort)
+        } else if discoveryFilter != nil {
+            socket?.broadcast(X32Protocol.xinfoRequest, port: X32Protocol.port)
         } else {
             socket?.broadcast(X32Protocol.infoRequest, port: X32Protocol.port)
         }
@@ -248,8 +267,14 @@ public final class X32Client {
         if console == nil {
             // A configured console that is still being resolved cannot answer yet.
             if endpoint != nil, destination == nil { return }
-            guard message.address == X32Protocol.infoAddress,
-                  Self.acceptsInfo(from: sender, expected: destination) else { return }
+            if let discoveryFilter {
+                // Another console may answer first; only the selected one is used.
+                guard let info = X32ConsoleInfo(message: message),
+                      discoveryFilter(info, ConsoleUDPSocket.text(of: sender)) else { return }
+            } else {
+                guard message.address == X32Protocol.infoAddress,
+                      Self.acceptsInfo(from: sender, expected: destination) else { return }
+            }
             console = sender
             subscribe()
         }
@@ -260,6 +285,8 @@ public final class X32Client {
         probeTimer?.cancel()
         probeTimer = nil
         state = .connected
+        // Read-only; names the console for the application's status.
+        sendToConsole(X32Protocol.xinfoRequest)
         requestMeters()
         requestNames()
         renewalTimer = makeTimer(interval: Self.renewalInterval) { [weak self] in
@@ -311,10 +338,17 @@ public final class X32Client {
         }
         switch message.address {
         case X32Protocol.infoAddress:
-            // version, server name, console model, console version
-            if texts.count >= 4 {
+            // version, server name, console model, console version. Once
+            // `/xinfo` has answered, its model is kept, as console lists show it.
+            if texts.count >= 4, name.isEmpty {
                 model = texts[2]
                 firmware = texts[3]
+            }
+        case X32Protocol.xinfoAddress:
+            if let info = X32ConsoleInfo(message: message) {
+                name = info.name
+                model = info.model
+                firmware = info.firmware
             }
         default:
             if nameAddressSet.contains(message.address),

@@ -82,6 +82,8 @@ final class MeterModel: ObservableObject {
     }
 
     let mixerBridge: MixerBridgeModel
+    /// Runs only while Settings shows the console page.
+    let mixerScanner: MixerScanner
     let wirelessMonitor: WirelessMonitorModel
 
     private let store: SettingsStore
@@ -109,6 +111,7 @@ final class MeterModel: ObservableObject {
     init(store: SettingsStore = SettingsStore()) {
         self.store = store
         mixerBridge = MixerBridgeModel()
+        mixerScanner = MixerScanner()
         wirelessMonitor = WirelessMonitorModel()
         recordingErrorStore = RecordingErrorStore()
         historyStore = RecordingHistoryStore()
@@ -267,7 +270,13 @@ final class MeterModel: ObservableObject {
 
     func setMixerKind(_ kind: MixerKind) {
         guard settings.mixer.kind != kind else { return }
-        settings.mixer.kind = kind
+        var mixer = settings.mixer
+        mixer.kind = kind
+        // A selected console of another type cannot be used.
+        if mixer.preferredConsole?.kind != kind {
+            mixer.preferredConsole = nil
+        }
+        settings.mixer = mixer
         if kind == .none, settings.spectrogram.displayMode == .meterBridge {
             settings.spectrogram.displayMode = .none
         }
@@ -277,6 +286,28 @@ final class MeterModel: ObservableObject {
         let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
         guard settings.mixer.address != trimmed else { return }
         settings.mixer.address = trimmed
+    }
+
+    /// Connects only to this console from now on. Its type becomes the console
+    /// type, and an entered address, which would take precedence, is cleared.
+    func selectMixerConsole(_ console: DiscoveredMixer) {
+        guard console.kind != .none else { return }
+        var mixer = settings.mixer
+        mixer.kind = console.kind
+        mixer.preferredConsole = PreferredMixer(console)
+        mixer.address = ""
+        guard mixer != settings.mixer else { return }
+        settings.mixer = mixer
+    }
+
+    /// Connects to the first console found again, which also needs an entered
+    /// address cleared.
+    func clearMixerConsoleSelection() {
+        var mixer = settings.mixer
+        mixer.preferredConsole = nil
+        mixer.address = ""
+        guard mixer != settings.mixer else { return }
+        settings.mixer = mixer
     }
 
     func setMixerSection(_ section: MixerMeterSectionDescriptor, isVisible: Bool) {
@@ -393,6 +424,7 @@ final class MeterModel: ObservableObject {
         timer?.invalidate()
         timer = nil
         mixerBridge.shutdown()
+        mixerScanner.stop()
         wirelessMonitor.shutdown()
         stopRecording(waitUntilClosed: true, finalStatus: .interrupted)
         for closingLogger in closingLoggers {

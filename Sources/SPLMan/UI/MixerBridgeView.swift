@@ -28,7 +28,7 @@ struct MixerBridgeView: View {
                 }
                 .opacity(bridge.phase.isConnected ? 0.6 : 0.3)
 
-                if let notice = MixerBridgeNotice.text(for: bridge.phase) {
+                if let notice = MixerBridgeNotice.text(for: bridge.phase, target: bridge.target) {
                     Text(notice)
                         .font(.callout)
                         .foregroundStyle(.secondary)
@@ -53,11 +53,29 @@ enum MixerBridgeNotice {
         L10n.text("Adresa mixpultu není platná. Zadejte IPv4 adresu nebo název v síti, případně s portem (např. 192.168.1.20:10023).")
     }
 
-    static func text(for phase: MixerConnectionController.Phase) -> String? {
+    static func searching(for target: PreferredMixer) -> String {
+        L10n.format("Hledám vybraný mixpult „%@“…", target.displayName)
+    }
+
+    static func unavailable(_ target: PreferredMixer) -> String {
+        L10n.format(
+            "Vybraný mixpult „%@“ není dostupný. Hledání se opakuje automaticky.",
+            target.displayName
+        )
+    }
+
+    /// - Parameter target: The selected console discovery waits for; without one,
+    ///   connecting is not worth a notice on the bridge.
+    static func text(
+        for phase: MixerConnectionController.Phase,
+        target: PreferredMixer? = nil
+    ) -> String? {
         switch phase {
         case .noSectionsSelected: noSections
         case .invalidAddress: invalidAddress
-        case .disabled, .connecting, .connected, .waitingToRetry: nil
+        case .connecting: target.map(searching(for:))
+        case .waitingToRetry: target.map(unavailable)
+        case .disabled, .connected: nil
         }
     }
 }

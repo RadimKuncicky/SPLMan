@@ -177,7 +177,28 @@ final class X32MixerDriver: MixerDriver {
         return levels
     }
 
-    func start(address: String?, sections: [MixerMeterSectionDescriptor]) {
+    /// Accepts only the `/xinfo` reply of the selected console, with the
+    /// reply's sender as its address; nil accepts the first console that answers.
+    static func discoveryFilter(
+        for target: PreferredMixer?
+    ) -> ((X32ConsoleInfo, String) -> Bool)? {
+        guard let target else { return nil }
+        return { info, sender in
+            target.matches(
+                kind: .behringerX32,
+                name: info.name,
+                model: info.model,
+                serial: "",
+                address: sender
+            )
+        }
+    }
+
+    func start(
+        address: String?,
+        target: PreferredMixer?,
+        sections: [MixerMeterSectionDescriptor]
+    ) {
         stop()
         let requested = Set(sections.map(\.id))
         active = Self.definitions.filter { requested.contains($0.descriptor.id) }
@@ -190,7 +211,8 @@ final class X32MixerDriver: MixerDriver {
         let client = X32Client(
             address: address,
             meterPages: Array(Set(active.map(\.page))).sorted(),
-            nameAddresses: active.flatMap(\.nameAddresses)
+            nameAddresses: active.flatMap(\.nameAddresses),
+            discoveryFilter: address == nil ? Self.discoveryFilter(for: target) : nil
         )
         self.client = client
         client.start()
@@ -211,7 +233,7 @@ final class X32MixerDriver: MixerDriver {
         var update = MixerDriverUpdate(
             state: .connected(MixerIdentity(
                 address: snapshot.address ?? "",
-                name: snapshot.model,
+                name: snapshot.name.isEmpty ? snapshot.model : snapshot.name,
                 model: snapshot.model,
                 firmware: snapshot.firmware
             )),

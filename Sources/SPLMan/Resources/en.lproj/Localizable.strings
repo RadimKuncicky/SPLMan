@@ -216,6 +216,14 @@
 "Mixpult není nastaven." = "No console is configured.";
 "Hledám mixpult…" = "Looking for the console…";
 "Mixpult není dostupný. Připojení se opakuje automaticky." = "The console is not available. Connecting again automatically.";
+"Mixpulty na síti" = "Consoles on the network";
+"Vyberte mixpult, ke kterému se má aplikace připojovat. WING se pozná podle sériového čísla, X32 a M32 podle názvu v síti a modelu. Dokud je mixpult vybraný, aplikace se k žádnému jinému nepřipojí." = "Choose the console the app connects to. A WING is recognized by its serial number, an X32 or M32 by its network name and model. While a console is selected, the app connects to no other console.";
+"Zadaná adresa má přednost před výběrem ze seznamu mixpultů na síti." = "An entered address takes precedence over the console chosen from the network list.";
+"Automaticky – první nalezený" = "Automatic – first one found";
+"Nenalezen v síti" = "Not found on the network";
+"Hledám mixpulty…" = "Looking for consoles…";
+"Hledám vybraný mixpult „%@“…" = "Looking for the selected console “%@”…";
+"Vybraný mixpult „%@“ není dostupný. Hledání se opakuje automaticky." = "The selected console “%@” is not available. Searching again automatically.";
 "Není vybrána žádná sekce meter bridge." = "No meter bridge section is selected.";
 "Adresa mixpultu není platná. Zadejte IPv4 adresu nebo název v síti, případně s portem (např. 192.168.1.20:10023)." = "The console address is not valid. Enter an IPv4 address or a network name, optionally with a port (for example 192.168.1.20:10023).";
 "Připojeno: %@" = "Connected: %@";
