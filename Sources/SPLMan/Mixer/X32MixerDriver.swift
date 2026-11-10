@@ -147,11 +147,33 @@ final class X32MixerDriver: MixerDriver {
         ]
     }()
 
+    /// Centre frequencies in Hz of the analyzer's 100 bands, about 1/10 octave
+    /// apart, from "Unofficial X32/M32 OSC Remote Protocol" (/meters/15).
+    static let rtaBandFrequencies: [Double] = [
+        20, 21, 22, 24, 26, 28, 30, 32, 34, 36,
+        39, 42, 45, 48, 52, 55, 59, 63, 68, 73,
+        78, 84, 90, 96, 103, 110, 118, 127, 136, 146,
+        156, 167, 179, 192, 206, 221, 237, 254, 272, 292,
+        313, 335, 359, 385, 412, 442, 474, 508, 544, 583,
+        625, 670, 718, 769, 825, 884, 947, 1_020, 1_090, 1_170,
+        1_250, 1_340, 1_440, 1_540, 1_650, 1_770, 1_890, 2_030, 2_180, 2_330,
+        2_500, 2_680, 2_870, 3_080, 3_300, 3_540, 3_790, 4_060, 4_350, 4_670,
+        5_000, 5_360, 5_740, 6_160, 6_600, 7_070, 7_580, 8_120, 8_710, 9_330,
+        10_000, 10_720, 11_490, 12_310, 13_200, 14_140, 15_160, 16_250, 17_410, 18_660
+    ]
+
+    // Analyzer settings, chosen on the console and only ever read.
+    static let rtaSourceAddress = "/-prefs/rta/source"
+    static let rtaTapAddress = "/-prefs/rta/pos"
+    static let rtaDetectorAddress = "/-prefs/rta/det"
+    static let rtaParameterAddresses = [rtaSourceAddress, rtaTapAddress, rtaDetectorAddress]
+
     /// Levels of a page this old are not shown, so a page that stopped arriving
     /// does not look live while other pages keep the connection alive.
     private let staleLevelsAfter: TimeInterval
     private var client: X32Client?
     private var active: [X32MeterDefinition] = []
+    private var includeRTA = false
     private var nameTargets: [String: (section: String, strip: Int)] = [:]
     private var namesRevision = 0
 
@@ -177,6 +199,81 @@ final class X32MixerDriver: MixerDriver {
         return levels
     }
 
+    /// Shows that the console is alive when only the analyzer is wanted, so a
+    /// console that sends no analyzer data keeps its connection. Its values
+    /// are not shown.
+    static let livenessPage = 2
+
+    /// The meter pages of the requested sections, plus the analyzer's.
+    static func meterPages(for active: [X32MeterDefinition], includeRTA: Bool) -> [Int] {
+        var pages = Set(active.map(\.page))
+        if includeRTA {
+            pages.insert(X32Protocol.rtaPage)
+            if active.isEmpty {
+                pages.insert(livenessPage)
+            }
+        }
+        return pages.sorted()
+    }
+
+    /// Analyzer levels, unless the analyzer page is missing or stale; other
+    /// pages may keep arriving without it.
+    static func rtaFrame(
+        levels: [Float]?,
+        age: TimeInterval?,
+        staleAfter: TimeInterval
+    ) -> MixerRTAFrame? {
+        guard let levels, !levels.isEmpty, let age, age < staleAfter else { return nil }
+        return MixerRTAFrame(levels: levels)
+    }
+
+    /// The console's name of an analyzer source: 1 the monitor bus, then
+    /// channels, aux inputs, effect returns, buses, matrices, main and mono.
+    /// Nil for 0 (no source) and unknown values.
+    static func rtaSourceLabel(_ value: Int32) -> String? {
+        let number = Int(value)
+        switch number {
+        case 1:
+            return "Monitor"
+        case 2...33:
+            return String(format: "Ch%02d", number - 1)
+        case 34...41:
+            return "Aux\(number - 33)"
+        case 42...49:
+            let side = (number - 42) % 2 == 0 ? "L" : "R"
+            return "FX\((number - 42) / 2 + 1)\(side)"
+        case 50...65:
+            return String(format: "Bus%02d", number - 49)
+        case 66...71:
+            return "Mtx\(number - 65)"
+        case 72:
+            return "Main"
+        case 73:
+            return "Mono"
+        default:
+            return nil
+        }
+    }
+
+    static func rtaInfo(parameters: [String: Int32]) -> MixerRTAInfo {
+        var info = MixerRTAInfo()
+        if let source = parameters[rtaSourceAddress] {
+            info.sourceIsNone = source == 0
+            info.source = rtaSourceLabel(source)
+        }
+        switch parameters[rtaTapAddress] {
+        case 0?: info.tap = L10n.text("Před EQ")
+        case 1?: info.tap = L10n.text("Po EQ")
+        default: break
+        }
+        switch parameters[rtaDetectorAddress] {
+        case 0?: info.detector = "RMS"
+        case 1?: info.detector = "PEAK"
+        default: break
+        }
+        return info
+    }
+
     /// Accepts only the `/xinfo` reply of the selected console, with the
     /// reply's sender as its address; nil accepts the first console that answers.
     static func discoveryFilter(
@@ -197,9 +294,11 @@ final class X32MixerDriver: MixerDriver {
     func start(
         address: String?,
         target: PreferredMixer?,
-        sections: [MixerMeterSectionDescriptor]
+        sections: [MixerMeterSectionDescriptor],
+        includeRTA: Bool
     ) {
         stop()
+        self.includeRTA = includeRTA
         let requested = Set(sections.map(\.id))
         active = Self.definitions.filter { requested.contains($0.descriptor.id) }
         nameTargets = [:]
@@ -210,8 +309,9 @@ final class X32MixerDriver: MixerDriver {
         }
         let client = X32Client(
             address: address,
-            meterPages: Array(Set(active.map(\.page))).sorted(),
+            meterPages: Self.meterPages(for: active, includeRTA: includeRTA),
             nameAddresses: active.flatMap(\.nameAddresses),
+            parameterAddresses: includeRTA ? Self.rtaParameterAddresses : [],
             discoveryFilter: address == nil ? Self.discoveryFilter(for: target) : nil
         )
         self.client = client
@@ -245,6 +345,14 @@ final class X32MixerDriver: MixerDriver {
                 staleAfter: staleLevelsAfter
             )
         )
+        if includeRTA {
+            update.rta = Self.rtaFrame(
+                levels: snapshot.rtaLevels,
+                age: snapshot.secondsSinceMeterPage[X32Protocol.rtaPage],
+                staleAfter: staleLevelsAfter
+            )
+            update.rtaInfo = Self.rtaInfo(parameters: snapshot.parameters)
+        }
 
         if snapshot.namesRevision != namesRevision {
             namesRevision = snapshot.namesRevision

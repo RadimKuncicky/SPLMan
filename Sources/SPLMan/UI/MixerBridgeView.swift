@@ -88,13 +88,32 @@ private struct MixerBridgeBars: View {
 
     var body: some View {
         Canvas(opaque: false, rendersAsynchronously: true) { context, _ in
-            let currentLevels = levels.snapshot()
+            let (currentLevels, currentPeaks) = levels.snapshotWithPeaks()
             var green = Path()
             var yellow = Path()
             var red = Path()
             for section in layout.sections {
                 guard let sectionLevels = currentLevels[section.id] else { continue }
+                let sectionPeaks = currentPeaks[section.id] ?? []
                 for bar in section.bars where bar.levelIndex < sectionLevels.count {
+                    if bar.levelIndex < sectionPeaks.count {
+                        let peak = Double(sectionPeaks[bar.levelIndex])
+                        if let top = MixerMeterScale.segments(levelDB: peak).last?.upper {
+                            let marker = CGRect(
+                                x: bar.frame.minX,
+                                y: bar.frame.maxY - bar.frame.height * top,
+                                width: bar.frame.width,
+                                height: 2
+                            ).intersection(bar.frame)
+                            if !marker.isNull, !marker.isEmpty {
+                                switch MixerMeterScale.zone(levelDB: peak) {
+                                case .green: green.addRect(marker)
+                                case .yellow: yellow.addRect(marker)
+                                case .red: red.addRect(marker)
+                                }
+                            }
+                        }
+                    }
                     let level = Double(sectionLevels[bar.levelIndex])
                     for segment in MixerMeterScale.segments(levelDB: level) {
                         let rectangle = CGRect(

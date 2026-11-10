@@ -26,6 +26,16 @@ enum MixerKind: String, CaseIterable, Codable, Identifiable {
         }
     }
 
+    /// Centre frequency in Hz of each band of the console's real-time analyzer,
+    /// in the order the console sends the bands.
+    var rtaBandFrequencies: [Double] {
+        switch self {
+        case .none: []
+        case .behringerWing: WingMixerDriver.rtaBandFrequencies
+        case .behringerX32: X32MixerDriver.rtaBandFrequencies
+        }
+    }
+
     /// Whether the driver can use the address. Nil or empty means automatic
     /// discovery, which every console supports.
     func isValidAddress(_ address: String?) -> Bool {
@@ -302,19 +312,45 @@ struct MixerDriverUpdate {
     var stripCounts: [String: Int] = [:]
     /// Changed names by section identifier and zero-based strip index.
     var names: [String: [Int: String]] = [:]
+    /// Fresh analyzer levels; nil when the analyzer is not requested or its
+    /// data stopped arriving, even while other meters still arrive.
+    var rta: MixerRTAFrame?
+    /// What the analyzer measures, nil when it is not requested.
+    var rtaInfo: MixerRTAInfo?
+}
+
+/// Levels of the console's real-time analyzer in dB, one per band, in the
+/// order of `MixerKind.rtaBandFrequencies`.
+struct MixerRTAFrame: Equatable {
+    var levels: [Float]
+}
+
+/// The analyzer settings as the console reports them. They are chosen on the
+/// console and only ever read. A part is nil until the console reports a
+/// value it can be shown for.
+struct MixerRTAInfo: Equatable {
+    var source: String?
+    /// The console reports that no source is selected.
+    var sourceIsNone = false
+    /// Where in the source the analyzer listens, such as before the equalizer.
+    var tap: String?
+    var detector: String?
 }
 
 /// One connection attempt to one console. Every method returns immediately and
-/// nothing may change the console's state: this feature only ever reads meters.
+/// nothing may change the console's state: this feature only ever reads meters
+/// and settings.
 protocol MixerDriver: AnyObject {
     /// - Parameters:
     ///   - address: The console's address, or nil for discovery.
     ///   - target: With discovery, the only console that may be connected;
     ///     nil connects to the first console found.
+    ///   - includeRTA: Whether to also read the console's real-time analyzer.
     func start(
         address: String?,
         target: PreferredMixer?,
-        sections: [MixerMeterSectionDescriptor]
+        sections: [MixerMeterSectionDescriptor],
+        includeRTA: Bool
     )
     func poll() -> MixerDriverUpdate
     func stop()
@@ -332,14 +368,60 @@ struct MixerBridgeSection: Equatable {
     var strips: [MixerBridgeStrip]
 }
 
+/// Holds each bar's highest level for `holdDuration`, then lets it fall to the
+/// current level. Not thread-safe; used from one queue.
+struct MixerPeakHold {
+    static let holdDuration: TimeInterval = 3
+
+    private struct Peak {
+        var level: Float
+        var time: TimeInterval
+    }
+
+    private var peaks: [String: [Peak]] = [:]
+
+    /// Returns the held peaks in the same shape as `levels`.
+    mutating func update(_ levels: [String: [Float]], now: TimeInterval) -> [String: [Float]] {
+        var updated: [String: [Peak]] = [:]
+        var result: [String: [Float]] = [:]
+        for (id, sectionLevels) in levels {
+            let previous = peaks[id]
+            var sectionPeaks: [Peak] = []
+            sectionPeaks.reserveCapacity(sectionLevels.count)
+            for (index, level) in sectionLevels.enumerated() {
+                var peak = Peak(level: level, time: now)
+                if let previous, index < previous.count {
+                    let held = previous[index]
+                    if !(level >= held.level), now - held.time < Self.holdDuration {
+                        peak = held
+                    }
+                }
+                sectionPeaks.append(peak)
+            }
+            updated[id] = sectionPeaks
+            result[id] = sectionPeaks.map(\.level)
+        }
+        peaks = updated
+        return result
+    }
+
+    mutating func reset() {
+        peaks = [:]
+    }
+}
+
 /// Latest levels, written by the connection queue and read while drawing.
 final class MixerLevelStore: @unchecked Sendable {
     private let lock = NSLock()
     private var levels: [String: [Float]] = [:]
+    private var peakLevels: [String: [Float]] = [:]
+    private var rtaLevels: [Float] = []
 
-    func replace(_ newLevels: [String: [Float]]) {
+    /// - Parameter peaks: Held peaks in the same shape as the levels.
+    func replace(_ newLevels: [String: [Float]], peaks newPeaks: [String: [Float]] = [:]) {
         lock.lock()
         levels = newLevels
+        peakLevels = newPeaks
         lock.unlock()
     }
 
@@ -347,5 +429,25 @@ final class MixerLevelStore: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return levels
+    }
+
+    /// Levels and their held peaks from the same moment.
+    func snapshotWithPeaks() -> (levels: [String: [Float]], peaks: [String: [Float]]) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (levels, peakLevels)
+    }
+
+    /// Analyzer levels in dB, empty when there are none to show.
+    func replaceRTA(_ newLevels: [Float]) {
+        lock.lock()
+        rtaLevels = newLevels
+        lock.unlock()
+    }
+
+    func rtaSnapshot() -> [Float] {
+        lock.lock()
+        defer { lock.unlock() }
+        return rtaLevels
     }
 }

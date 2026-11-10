@@ -8,15 +8,20 @@ enum MixerTests {
         var update = MixerDriverUpdate(state: .connecting)
         var startedAddress: String??
         var startedTarget: PreferredMixer??
+        var startedSections: [MixerMeterSectionDescriptor] = []
+        var startedIncludeRTA: Bool?
         var stopCount = 0
 
         func start(
             address: String?,
             target: PreferredMixer?,
-            sections: [MixerMeterSectionDescriptor]
+            sections: [MixerMeterSectionDescriptor],
+            includeRTA: Bool
         ) {
             startedAddress = .some(address)
             startedTarget = .some(target)
+            startedSections = sections
+            startedIncludeRTA = includeRTA
         }
 
         func poll() -> MixerDriverUpdate { update }
@@ -51,7 +56,57 @@ enum MixerTests {
         testConsoleSwitchClearsNames(&failures)
         testWingDiscoveryTarget(&failures)
         testX32ConsoleInfo(&failures)
+        testX32RTADecoding(&failures)
+        testX32RTAStaleness(&failures)
+        testX32RTASettings(&failures)
+        testWingRTARequest(&failures)
+        testWingRTAMeasurement(&failures)
+        testWingStreamIntegers(&failures)
+        testWingRTASettings(&failures)
+        testRTARequestsAreReadOnly(&failures)
+        testRTAConnection(&failures)
+        testRTAMissingRetry(&failures)
+        testRTALiveness(&failures)
+        testRTADisplayMode(&failures)
+        testRTALayout(&failures)
+        testRTAText(&failures)
+        testPeakHold(&failures)
         return failures
+    }
+
+    private static func testPeakHold(_ failures: inout [String]) {
+        var hold = MixerPeakHold()
+        func peak(_ result: [String: [Float]]) -> Float? { result["a"]?.first }
+        if peak(hold.update(["a": [-10]], now: 100)) != -10 {
+            failures.append("Peak hold must start at the current level")
+        }
+        if peak(hold.update(["a": [-30]], now: 102.9)) != -10 {
+            failures.append("Peak hold must keep the peak for 3 seconds")
+        }
+        if peak(hold.update(["a": [-20]], now: 103)) != -20 {
+            failures.append("Peak hold must fall to the current level after 3 seconds")
+        }
+        if peak(hold.update(["a": [-5]], now: 103.1)) != -5 {
+            failures.append("A higher level must replace the held peak immediately")
+        }
+        if peak(hold.update(["a": [-40]], now: 105)) != -5 {
+            failures.append("A new peak must be held for 3 seconds from its own time")
+        }
+        if hold.update(["b": [0]], now: 105.1)["a"] != nil {
+            failures.append("Peak hold kept a section that disappeared")
+        }
+        if peak(hold.update(["a": [-50]], now: 105.2)) != -50 {
+            failures.append("A returning section must not inherit an old peak")
+        }
+        hold.reset()
+        if peak(hold.update(["a": [-50]], now: 105.3)) != -50 {
+            failures.append("Peak hold reset did not clear the peaks")
+        }
+        let scale = MixerMeterScale.self
+        if scale.zone(levelDB: -18) != .green || scale.zone(levelDB: -17.9) != .yellow
+            || scale.zone(levelDB: -0.1) != .yellow || scale.zone(levelDB: 0) != .red {
+            failures.append("Mixer meter zone does not match its segments")
+        }
     }
 
     private static func testScale(_ failures: inout [String]) {
@@ -1321,6 +1376,667 @@ enum MixerTests {
         }
         if !addressFilter(info, "192.168.0.64") || addressFilter(other, "192.168.0.65") {
             failures.append("X32 discovery did not select a console without a name by its sender")
+        }
+    }
+
+    // MARK: - Console RTA
+
+    /// Examples from "Unofficial X32/M32 OSC Remote Protocol", /meters/15.
+    private static func testX32RTADecoding(_ failures: inout [String]) {
+        var blob: [UInt8] = [50, 0, 0, 0, 0x00, 0x80, 0x00, 0xc0, 0x40, 0xe0, 0xff, 0xff]
+        blob += [UInt8](repeating: 0, count: 48 * 4)
+        guard let levels = X32Protocol.rtaLevels(blob: blob), levels.count == 100 else {
+            failures.append("X32 RTA page was not decoded into 100 bands")
+            return
+        }
+        if levels[0] != -128 || levels[1] != -64 || levels[2] != -31.75
+            || levels[3] != -0.003_906_25 || levels[99] != 0 {
+            failures.append("X32 RTA levels were not decoded as signed 1/256 dB, lower half first")
+        }
+        if X32Protocol.rtaLevels(blob: Array(blob.dropLast())) != nil {
+            failures.append("A short X32 RTA page was accepted")
+        }
+        var wrongCount = blob
+        wrongCount[0] = 49
+        if X32Protocol.rtaLevels(blob: wrongCount) != nil {
+            failures.append("An X32 RTA page with a wrong value count was accepted")
+        }
+        if X32Protocol.rtaLevels(blob: []) != nil || X32Protocol.rtaLevels(blob: [50, 0, 0]) != nil {
+            failures.append("A truncated X32 RTA page was accepted")
+        }
+
+        let reply = Array("/meters/15\0\0,b\0\0".utf8) + [0, 0, 0, UInt8(blob.count)] + blob
+        guard let message = X32Message(packet: reply),
+              X32Protocol.meterPage(address: message.address) == X32Protocol.rtaPage,
+              case .blob(let received)? = message.arguments.first,
+              X32Protocol.rtaLevels(blob: received) == levels else {
+            failures.append("X32 RTA reply was not read")
+            return
+        }
+
+        let frequencies = X32MixerDriver.rtaBandFrequencies
+        if frequencies.count != X32Protocol.rtaBandCount
+            || frequencies.first != 20 || frequencies.last != 18_660
+            || zip(frequencies, frequencies.dropFirst()).contains(where: { $0 >= $1 }) {
+            failures.append("X32 RTA band frequencies do not match the protocol table")
+        }
+    }
+
+    private static func testX32RTAStaleness(_ failures: inout [String]) {
+        let staleAfter = MixerConnectionController.Timing().staleLevelsAfter
+        let levels = [Float](repeating: -40, count: 100)
+        if X32MixerDriver.rtaFrame(levels: levels, age: staleAfter / 2, staleAfter: staleAfter)?.levels
+            != levels {
+            failures.append("Fresh X32 RTA levels were not shown")
+        }
+        if X32MixerDriver.rtaFrame(levels: levels, age: staleAfter, staleAfter: staleAfter) != nil {
+            failures.append("A stale X32 RTA page stayed on the display")
+        }
+        if X32MixerDriver.rtaFrame(levels: levels, age: nil, staleAfter: staleAfter) != nil
+            || X32MixerDriver.rtaFrame(levels: nil, age: 0, staleAfter: staleAfter) != nil
+            || X32MixerDriver.rtaFrame(levels: [], age: 0, staleAfter: staleAfter) != nil {
+            failures.append("X32 RTA levels without a page or a reception time were shown")
+        }
+        // Bridge pages keep arriving while the analyzer page stopped.
+        let channels = X32MixerDriver.definitions.filter { $0.descriptor.id == "ch" }
+        let bridge = X32MixerDriver.levels(
+            for: channels,
+            pages: [0: [Float](repeating: 1, count: 70)],
+            ages: [0: 0.05, X32Protocol.rtaPage: staleAfter * 2],
+            staleAfter: staleAfter
+        )
+        if bridge["ch"]?.count != 32 {
+            failures.append("A stale X32 RTA page hid the meter bridge")
+        }
+    }
+
+    private static func testX32RTASettings(_ failures: inout [String]) {
+        let reply = Array("/-prefs/rta/source\0\0,i\0\0".utf8) + [0, 0, 0, 5]
+        let expected: [X32Message.Argument] = [.int(5)]
+        guard let message = X32Message(packet: reply),
+              message.address == X32MixerDriver.rtaSourceAddress,
+              message.arguments == expected else {
+            failures.append("X32 integer parameter reply was not read")
+            return
+        }
+
+        let source = X32MixerDriver.rtaSourceAddress
+        let tap = X32MixerDriver.rtaTapAddress
+        let detector = X32MixerDriver.rtaDetectorAddress
+        let info = X32MixerDriver.rtaInfo(parameters: [source: 5, tap: 1, detector: 0])
+        if info != MixerRTAInfo(source: "Ch04", tap: L10n.text("Po EQ"), detector: "RMS") {
+            failures.append("X32 RTA settings were not named")
+        }
+        let labels: [Int32: String] = [
+            1: "Monitor", 2: "Ch01", 33: "Ch32", 34: "Aux1", 41: "Aux8",
+            42: "FX1L", 43: "FX1R", 49: "FX4R", 50: "Bus01", 65: "Bus16",
+            66: "Mtx1", 71: "Mtx6", 72: "Main", 73: "Mono"
+        ]
+        for (value, label) in labels where X32MixerDriver.rtaSourceLabel(value) != label {
+            failures.append("X32 RTA source \(value) was not named \(label)")
+        }
+        if X32MixerDriver.rtaSourceLabel(0) != nil
+            || X32MixerDriver.rtaSourceLabel(74) != nil
+            || X32MixerDriver.rtaSourceLabel(-1) != nil {
+            failures.append("An X32 RTA source without a strip was given a name")
+        }
+        let none = X32MixerDriver.rtaInfo(parameters: [source: 0, tap: 0, detector: 1])
+        if none != MixerRTAInfo(sourceIsNone: true, tap: L10n.text("Před EQ"), detector: "PEAK") {
+            failures.append("X32 RTA without a source was not reported")
+        }
+        if X32MixerDriver.rtaInfo(parameters: [source: 99, tap: 7, detector: 9]) != MixerRTAInfo()
+            || X32MixerDriver.rtaInfo(parameters: [:]) != MixerRTAInfo() {
+            failures.append("Unknown or missing X32 RTA settings were shown")
+        }
+    }
+
+    private static func testWingRTARequest(_ failures: inout [String]) {
+        let rtaOnly: [UInt8] = [0xdf, 0xd3, 0xd4, 0, 0, 0, 1, 0xdc, 0xaa, 0xde, 0xdf, 0xd1]
+        if WingProtocol.meterRequest(reportID: 1, meters: [.rta]) != rtaOnly {
+            failures.append("WING RTA meter request must carry only its type")
+        }
+        let mixed: [UInt8] = [
+            0xdf, 0xd3, 0xd4, 0, 0, 0, 1, 0xdc, 0xa0, 0x01, 0xa7, 0x02, 0xaa, 0xde, 0xdf, 0xd1
+        ]
+        let meters: [WingMeter] = [
+            WingMeter(kind: .channel, index: 1), WingMeter(kind: .source, index: 2), .rta
+        ]
+        if WingProtocol.meterRequest(reportID: 1, meters: meters) != mixed {
+            failures.append("Indexed WING meters changed next to the RTA")
+        }
+        if WingMeter.Kind.rta.hasIndex || !WingMeter.Kind.output.hasIndex {
+            failures.append("Only the WING RTA meter has no index")
+        }
+    }
+
+    private static func testWingRTAMeasurement(_ failures: inout [String]) {
+        let ch0 = WingMeter(kind: .channel, index: 0)
+        let groups = [
+            WingMeterGroup(meters: [ch0], isRequired: true),
+            WingMeterGroup(meters: [.rta], isRequired: false)
+        ]
+        var present = WingGroupMeasurement(groups: groups)
+        if present.start() != .request([ch0])
+            || present.receive(length: 8) != .request([ch0, .rta])
+            || present.receive(length: 8) != nil
+            || present.receive(length: 128) != .finished(lengths: [8, 120]) {
+            failures.append("The WING RTA group was not measured after the sections")
+        }
+        var absent = WingGroupMeasurement(groups: groups)
+        if absent.start() != .request([ch0])
+            || absent.receive(length: 8) != .request([ch0, .rta])
+            || absent.receive(length: 8) != nil
+            || absent.timeout() != .finished(lengths: [8, 0]) {
+            failures.append("A WING console without RTA data ended or blocked the session")
+        }
+        let report = [Int16](repeating: 0, count: 8) + [Int16](repeating: -2_560, count: 120)
+        guard let split = WingProtocol.split(report, lengths: [8, 120]), split.count == 2 else {
+            failures.append("A WING report with an RTA group was not split")
+            return
+        }
+        if WingMixerDriver.rtaFrame(from: split[1])?.levels != [Float](repeating: -10, count: 120) {
+            failures.append("WING RTA levels were not decoded in 1/256 dB")
+        }
+        if WingMixerDriver.rtaFrame(from: []) != nil {
+            failures.append("An empty WING RTA group was shown")
+        }
+        if WingMixerDriver.rtaFrame(from: [Int16](repeating: 0, count: 130))?.levels.count != 120
+            || WingMixerDriver.rtaFrame(from: [256, -256])?.levels != [1, -1] {
+            failures.append("A WING RTA group of an unexpected length was not limited safely")
+        }
+
+        let frequencies = WingMixerDriver.rtaBandFrequencies
+        if frequencies.count != 120
+            || abs(frequencies[0] - 20) > 1e-9
+            || abs(frequencies[12] - 40) > 1e-9
+            || zip(frequencies, frequencies.dropFirst()).contains(where: { $0 >= $1 }) {
+            failures.append("WING RTA bands are not 1/12 octave from 20 Hz")
+        }
+    }
+
+    private static func testWingStreamIntegers(_ failures: inout [String]) {
+        var parser = WingStreamParser()
+        let node = Int32(bitPattern: 0x0102_0304)
+        let hash: [UInt8] = [0xd7, 0x01, 0x02, 0x03, 0x04]
+        func values(_ bytes: [UInt8]) -> [WingNodeValue.Value] {
+            let received = parser.consumeValues(bytes)
+            if received.contains(where: { $0.node != node }) {
+                failures.append("WING value was assigned to the wrong node")
+            }
+            return received.map(\.value)
+        }
+
+        if values([0xdf, 0xd1] + hash + [0x00, 0x01, 0x05, 0x3f])
+            != [.integer(0), .integer(1), .integer(5), .integer(63)] {
+            failures.append("Small WING integers were not decoded")
+        }
+        if values(hash + [0xd3, 0xff, 0xfe]) != [.integer(-2)]
+            || values(hash + [0xd4, 0x00, 0x01, 0x00, 0x00]) != [.integer(65_536)]
+            || values(hash + [0xd4, 0xff, 0xff, 0xff, 0xff]) != [.integer(-1)] {
+            failures.append("WING 16-bit or 32-bit integers were not decoded")
+        }
+        let first = values(hash + [0xd3, 0x01])
+        let second = values([0x00])
+        if !first.isEmpty || second != [.integer(256)] {
+            failures.append("A WING integer split across chunks was not decoded")
+        }
+        // Float bytes that look like other tokens are skipped whole.
+        if values(hash + [0xd5, 0x3f, 0x80, 0x00, 0x00, 0xd6, 0x00, 0x01, 0xd3, 0x05, 0x07])
+            != [.integer(7)] {
+            failures.append("WING float values were not skipped")
+        }
+        if values(hash + [0x84] + Array("PREEQ".utf8)) != [.text("PREEQ")] {
+            failures.append("WING text value was not reported with the integers")
+        }
+        if !values([0xda, 0x05]).isEmpty {
+            failures.append("WING integer after navigation was given the last hashed node")
+        }
+
+        var textParser = WingStreamParser()
+        let texts = textParser.consume([0xdf, 0xd1] + hash + [0x05, 0xd3, 0x00, 0x07, 0x80, 0x41])
+        if texts.map(\.text) != ["A"] {
+            failures.append("WING integers reached the text values")
+        }
+    }
+
+    private static func testWingRTASettings(_ failures: inout [String]) {
+        let labels: [Int32: String] = [
+            1: "CH 1", 40: "CH 40", 41: "AUX 1", 48: "AUX 8", 49: "BUS 1",
+            64: "BUS 16", 65: "MAIN 1", 68: "MAIN 4", 69: "MTX 1", 76: "MTX 8"
+        ]
+        for (index, label) in labels where WingMixerDriver.rtaSourceLabel(index) != label {
+            failures.append("WING RTA source \(index) was not named \(label)")
+        }
+        if WingMixerDriver.rtaSourceLabel(0) != nil
+            || WingMixerDriver.rtaSourceLabel(77) != nil
+            || WingMixerDriver.rtaSourceLabel(-1) != nil {
+            failures.append("A WING RTA source without a strip was given a name")
+        }
+
+        let source = WingMixerDriver.rtaSourceNode
+        let tap = WingMixerDriver.rtaTapNode
+        let detector = WingMixerDriver.rtaDetectorNode
+        let info = WingMixerDriver.rtaInfo(values: [
+            source: .integer(3), tap: .text("PREEQ"), detector: .text("RMS")
+        ])
+        if info != MixerRTAInfo(source: "CH 3", tap: L10n.text("Před EQ"), detector: "RMS") {
+            failures.append("WING RTA settings were not named")
+        }
+        let asReceived = WingMixerDriver.rtaInfo(values: [
+            source: .integer(0), tap: .text("MON.PH"), detector: .text("AVG")
+        ])
+        if asReceived != MixerRTAInfo(sourceIsNone: true, tap: "MON.PH", detector: "AVG") {
+            failures.append("WING RTA tap or detector was not shown as received")
+        }
+        if WingMixerDriver.rtaInfo(values: [tap: .text("POSTEQ")]).tap != L10n.text("Po EQ") {
+            failures.append("WING post-EQ tap was not named")
+        }
+        if WingMixerDriver.rtaInfo(values: [:]) != MixerRTAInfo()
+            || WingMixerDriver.rtaInfo(values: [tap: .integer(3), detector: .text(" ")]) != MixerRTAInfo() {
+            failures.append("Missing or unreadable WING RTA settings were shown")
+        }
+        if WingMixerDriver.rtaNodes != [792_206_572, -230_889_283, 3_015_320] {
+            failures.append("WING RTA setting nodes changed")
+        }
+    }
+
+    /// Nothing the analyzer sends may change the console.
+    private static func testRTARequestsAreReadOnly(_ failures: inout [String]) {
+        let meters = X32Message(packet: X32Protocol.meterRequest(page: X32Protocol.rtaPage))
+        let page: [X32Message.Argument] = [.string("/meters/15")]
+        if meters?.address != "/meters" || meters?.arguments != page {
+            failures.append("X32 RTA page was not requested like other meters")
+        }
+        for address in X32MixerDriver.rtaParameterAddresses {
+            let read = X32Message(packet: X32Protocol.read(address))
+            if read?.address != address || read?.arguments.isEmpty != true {
+                failures.append("X32 RTA setting \(address) was not only read")
+            }
+        }
+
+        for node in WingMixerDriver.rtaNodes {
+            let raw = UInt32(bitPattern: node)
+            var expected: [UInt8] = [0xd7]
+            for shift in [24, 16, 8, 0] {
+                let byte = UInt8(truncatingIfNeeded: raw >> UInt32(shift))
+                expected.append(byte)
+                if byte == 0xdf { expected.append(0xde) }
+            }
+            expected.append(0xdc)
+            if WingProtocol.nodeDataRequest(node: node) != expected {
+                failures.append("WING RTA setting \(node) was not only read")
+            }
+        }
+    }
+
+    private static func testRTAConnection(_ failures: inout [String]) {
+        var drivers: [FakeDriver] = []
+        let timing = MixerConnectionController.Timing()
+        let controller = MixerConnectionController(timing: timing) { kind in
+            guard kind != .none else { return nil }
+            let driver = FakeDriver()
+            drivers.append(driver)
+            return driver
+        }
+        let identity = MixerIdentity(address: "10.0.0.3", name: "X32", model: "X32", firmware: "4")
+
+        var settings = MixerSettings()
+        settings.kind = .behringerX32
+        for section in settings.kind.sections {
+            settings.setVisible(section, false)
+        }
+        controller.configure(settings, now: 0)
+        if controller.phase != .noSectionsSelected || !drivers.isEmpty {
+            failures.append("A mixer without sections connected without the RTA")
+        }
+        controller.configure(settings, includeRTA: true, now: 1)
+        guard drivers.count == 1, let driver = drivers.last, controller.phase == .connecting else {
+            failures.append("The RTA without meter bridge sections did not connect")
+            return
+        }
+        if driver.startedIncludeRTA != true || !driver.startedSections.isEmpty {
+            failures.append("The RTA was not requested from the driver")
+        }
+
+        let frame = MixerRTAFrame(levels: [-20, -30, -40])
+        let info = MixerRTAInfo(source: "Ch01", tap: "Pre EQ", detector: "RMS")
+        driver.update = MixerDriverUpdate(
+            state: .connected(identity),
+            secondsSinceMeterData: 0.02,
+            rta: frame,
+            rtaInfo: info
+        )
+        controller.tick(now: 1)
+        if controller.rta != frame || controller.rtaInfo != info
+            || controller.isRTAMissing || !controller.phase.isConnected {
+            failures.append("Connected RTA levels or settings were not delivered")
+        }
+
+        // The analyzer data stops while other meters keep arriving.
+        driver.update.rta = nil
+        controller.tick(now: 1 + timing.staleLevelsAfter / 2)
+        if controller.rta != nil || !controller.phase.isConnected || controller.isRTAMissing {
+            failures.append("Missing RTA data was not cleared, or was reported before it was due")
+        }
+        controller.tick(now: 1 + timing.staleLevelsAfter)
+        if !controller.isRTAMissing || controller.rtaInfo != info {
+            failures.append("RTA data that stopped arriving was not reported")
+        }
+
+        driver.update.rta = frame
+        driver.update.secondsSinceMeterData = timing.staleLevelsAfter
+        controller.tick(now: 3)
+        if controller.rta != nil {
+            failures.append("Stale RTA levels stayed on the display")
+        }
+        // Every meter is stale: the connection state explains it, not the RTA.
+        driver.update.rta = nil
+        controller.tick(now: 3)
+        if controller.isRTAMissing || !controller.phase.isConnected {
+            failures.append("A full meter data outage was reported as missing RTA data")
+        }
+        driver.update.secondsSinceMeterData = timing.meterDataTimeout
+        controller.tick(now: 3)
+        if controller.phase != .waitingToRetry || controller.rta != nil
+            || controller.rtaInfo != nil || controller.isRTAMissing {
+            failures.append("A lost console kept its RTA data")
+        }
+
+        controller.tick(now: 3 + timing.retryDelay)
+        controller.configure(settings, includeRTA: false, now: 10)
+        if controller.phase != .noSectionsSelected || drivers.count != 2 || drivers.last?.stopCount != 1 {
+            failures.append("Leaving the RTA kept a connection without sections")
+        }
+
+        settings = MixerSettings()
+        settings.kind = .behringerX32
+        controller.configure(settings, now: 20)
+        let withoutRTA = drivers.count
+        controller.configure(settings, includeRTA: true, now: 21)
+        if drivers.count != withoutRTA + 1
+            || drivers[withoutRTA - 1].stopCount != 1
+            || drivers.last?.startedIncludeRTA != true
+            || drivers.last?.startedSections.isEmpty != false {
+            failures.append("Switching to the RTA did not restart the connection with the bridge sections")
+        }
+
+        controller.configure(settings, includeRTA: false, now: 22)
+        drivers.last?.update = MixerDriverUpdate(
+            state: .connected(identity),
+            secondsSinceMeterData: 0.02,
+            rta: frame,
+            rtaInfo: info
+        )
+        controller.tick(now: 30)
+        if controller.rta != nil || controller.rtaInfo != nil || controller.isRTAMissing
+            || !controller.phase.isConnected {
+            failures.append("RTA data was used while the RTA was not wanted")
+        }
+    }
+
+    /// A driver learns at connection time which analyzer data a console sends,
+    /// so analyzer data missing for long while other meters arrive reconnects.
+    private static func testRTAMissingRetry(_ failures: inout [String]) {
+        var drivers: [FakeDriver] = []
+        let timing = MixerConnectionController.Timing()
+        let controller = MixerConnectionController(timing: timing) { kind in
+            guard kind != .none else { return nil }
+            let driver = FakeDriver()
+            drivers.append(driver)
+            return driver
+        }
+        let identity = MixerIdentity(address: "10.0.0.4", name: "WING", model: "wing", firmware: "3")
+        let frame = MixerRTAFrame(levels: [-20, -30])
+        var settings = MixerSettings()
+        settings.kind = .behringerWing
+        controller.configure(settings, includeRTA: true, now: 0)
+        guard let first = drivers.last else {
+            failures.append("The RTA did not connect")
+            return
+        }
+        first.update = MixerDriverUpdate(
+            state: .connected(identity),
+            secondsSinceMeterData: 0.02,
+            levels: ["ch": [-20, -20]],
+            rta: nil,
+            rtaInfo: MixerRTAInfo()
+        )
+        let limit = timing.rtaMissingRetryAfter
+        controller.tick(now: 0)
+        controller.tick(now: limit - 0.1)
+        if !controller.phase.isConnected || !controller.isRTAMissing
+            || controller.levels["ch"] == nil || first.stopCount != 0 {
+            failures.append("Missing RTA data reconnected too early or hid the meter bridge")
+        }
+        controller.tick(now: limit)
+        if controller.phase != .waitingToRetry || first.stopCount != 1 {
+            failures.append("RTA data missing while other meters arrive did not reconnect")
+        }
+        controller.tick(now: limit + timing.retryDelay - 0.1)
+        if drivers.count != 1 {
+            failures.append("Missing RTA data reconnected before the retry delay")
+        }
+        var now = limit + timing.retryDelay
+        controller.tick(now: now)
+        guard drivers.count == 2, let second = drivers.last else {
+            failures.append("Missing RTA data did not start a new connection")
+            return
+        }
+
+        // Interrupted gaps and stale meters do not count as missing RTA data.
+        second.update = MixerDriverUpdate(
+            state: .connected(identity),
+            secondsSinceMeterData: 0.02,
+            rta: nil
+        )
+        controller.tick(now: now)
+        now += limit - 1
+        controller.tick(now: now)
+        second.update.rta = frame
+        controller.tick(now: now)
+        second.update.rta = nil
+        now += limit - 1
+        controller.tick(now: now)
+        second.update.secondsSinceMeterData = timing.staleLevelsAfter
+        now += limit
+        controller.tick(now: now)
+        if !controller.phase.isConnected || drivers.count != 2 || second.stopCount != 0 {
+            failures.append("Interrupted or stale RTA gaps reconnected the console")
+        }
+        second.update.secondsSinceMeterData = 0.02
+        second.update.rta = frame
+        now += 2 * limit
+        controller.tick(now: now)
+        if !controller.phase.isConnected || controller.rta != frame || drivers.count != 2 {
+            failures.append("Arriving RTA data reconnected the console")
+        }
+    }
+
+    /// With only the analyzer wanted, a hidden meter keeps the connection alive.
+    private static func testRTALiveness(_ failures: inout [String]) {
+        let x32Channels = X32MixerDriver.definitions.filter { $0.descriptor.id == "ch" }
+        if X32MixerDriver.meterPages(for: [], includeRTA: true) != [2, 15]
+            || X32MixerDriver.meterPages(for: x32Channels, includeRTA: true) != [0, 15]
+            || X32MixerDriver.meterPages(for: x32Channels, includeRTA: false) != [0]
+            || !X32MixerDriver.meterPages(for: [], includeRTA: false).isEmpty {
+            failures.append("X32 liveness page is not requested exactly when only the RTA is wanted")
+        }
+        let x32Hidden = X32MixerDriver.levels(
+            for: [],
+            pages: [2: [Float](repeating: 1, count: 49)],
+            ages: [2: 0.05],
+            staleAfter: 1
+        )
+        if !x32Hidden.isEmpty {
+            failures.append("X32 liveness page was shown as levels")
+        }
+
+        let liveness = WingMixerDriver.livenessGroup
+        let rtaGroup = WingMeterGroup(meters: [.rta], isRequired: false)
+        let rtaOnly = WingMixerDriver.meterGroups(for: [], includeRTA: true)
+        if rtaOnly.groups != [liveness, rtaGroup] || rtaOnly.rtaGroup != 1
+            || !liveness.isRequired || liveness.meters.count != 4
+            || !liveness.meters.allSatisfy({ $0.kind == .main }) {
+            failures.append("WING RTA without sections has no required liveness group before the RTA")
+        }
+        let wingChannels = WingMixerDriver.definitions.filter { $0.descriptor.id == "ch" }
+        let withSection = WingMixerDriver.meterGroups(for: wingChannels, includeRTA: true)
+        if withSection.groups.count != 2 || withSection.groups.first?.meters != wingChannels.first?.meters
+            || withSection.groups.last != rtaGroup || withSection.rtaGroup != 1 {
+            failures.append("WING RTA group does not follow the section groups")
+        }
+        let bridgeOnly = WingMixerDriver.meterGroups(for: wingChannels, includeRTA: false)
+        if bridgeOnly.groups.count != 1 || bridgeOnly.rtaGroup != nil {
+            failures.append("WING groups changed without the RTA")
+        }
+
+        let rtaWords = [Int16](repeating: -2_560, count: 120)
+        let hidden = WingMixerDriver.levels(
+            for: [],
+            reports: [[Int16](repeating: -256, count: 32), rtaWords]
+        )
+        if !hidden.levels.isEmpty || !hidden.stripCounts.isEmpty {
+            failures.append("WING liveness or RTA group was shown as a section")
+        }
+        let shown = WingMixerDriver.levels(
+            for: wingChannels,
+            reports: [[Int16](repeating: -256, count: 320), rtaWords]
+        )
+        if shown.levels.count != 1 || shown.levels["ch"]?.count != 80 {
+            failures.append("WING section levels changed next to the RTA group")
+        }
+    }
+
+    private static func testRTADisplayMode(_ failures: inout [String]) {
+        if AnalysisDisplayMode.combined.next != .meterBridge
+            || AnalysisDisplayMode.meterBridge.next != .rta
+            || AnalysisDisplayMode.rta.next != .wireless
+            || AnalysisDisplayMode.wireless.next != .none {
+            failures.append("The RTA is not cycled between the meter bridge and the wireless view")
+        }
+        let rta = AnalysisDisplayMode.rta
+        if rta.usesAudioAnalysis || rta.showsSpectrogram || rta.showsTransferFunction {
+            failures.append("The console RTA must not run the audio analysis")
+        }
+        let order = AnalysisDisplayMode.allCases
+        if let bridge = order.firstIndex(of: .meterBridge), order.firstIndex(of: .rta) != bridge + 1 {
+            failures.append("The RTA is not offered after the meter bridge")
+        }
+        if !MixerKind.none.rtaBandFrequencies.isEmpty
+            || MixerKind.behringerX32.rtaBandFrequencies.count != 100
+            || MixerKind.behringerWing.rtaBandFrequencies.count != 120 {
+            failures.append("RTA bands do not match the console type")
+        }
+    }
+
+    private static func testRTALayout(_ failures: inout [String]) {
+        typealias Layout = MixerRTALayout
+        for kind in [MixerKind.behringerX32, .behringerWing] {
+            let frequencies = kind.rtaBandFrequencies
+            for size in [CGSize(width: 1_600, height: 400), CGSize(width: 320, height: 120)] {
+                let layout = Layout.compute(frequencies: frequencies, size: size)
+                if layout.bands.map(\.index) != Array(frequencies.indices) {
+                    failures.append("Not every \(kind) RTA band was placed at \(size)")
+                    continue
+                }
+                if layout.plot.minY != Layout.headerHeight
+                    || abs(layout.plot.maxY - (size.height - Layout.axisHeight)) > 0.001 {
+                    failures.append("RTA bands overlap the header or the frequency axis at \(size)")
+                }
+                for (index, band) in layout.bands.enumerated() {
+                    let frame = band.frame
+                    if frame.minX < layout.plot.minX - 0.001 || frame.maxX > layout.plot.maxX + 0.001
+                        || frame.width <= 0 || frame.height != layout.plot.height {
+                        failures.append("\(kind) RTA band \(index) left the display at \(size)")
+                    }
+                    if index > 0, frame.minX < layout.bands[index - 1].frame.maxX - 0.001 {
+                        failures.append("\(kind) RTA bands \(index - 1) and \(index) overlap at \(size)")
+                    }
+                    if let centre = layout.x(for: frequencies[index]),
+                       centre < frame.minX - 0.001 || centre > frame.maxX + 1.001 {
+                        failures.append("\(kind) RTA band \(index) is not at its frequency at \(size)")
+                    }
+                }
+                if layout.ticks.first?.frequency != 20 || layout.ticks.last?.frequency != 20_000 {
+                    failures.append("RTA frequency axis does not span 20 Hz to 20 kHz at \(size)")
+                }
+                if size.width >= 600,
+                   zip(layout.ticks, layout.ticks.dropFirst()).contains(where: { $1.x - $0.x < 52 }) {
+                    failures.append("RTA frequency labels crowd at \(size)")
+                }
+                if layout.gridLines.map(\.levelDB) != Array(stride(from: -80.0, through: 0, by: 10))
+                    || layout.gridLines.filter(\.isLabeled).map(\.levelDB) != [-80, -60, -40, -20, 0] {
+                    failures.append("RTA dB grid is not every 10 dB, labeled every 20 dB")
+                }
+            }
+        }
+
+        if Layout.fraction(levelDB: -80) != 0 || Layout.fraction(levelDB: 0) != 1
+            || abs(Layout.fraction(levelDB: -40) - 0.5) > 1e-9 || Layout.fraction(levelDB: -120) != 0 {
+            failures.append("RTA levels are not drawn from -80 dB to 0 dB")
+        }
+        if Layout.fraction(levelDB: -.infinity) != 0 || Layout.fraction(levelDB: 6) != 1 {
+            failures.append("RTA levels outside the scale are not clamped")
+        }
+        if Layout.isClipped(levelDB: -0.2) || !Layout.isClipped(levelDB: -0.1)
+            || !Layout.isClipped(levelDB: 0) || Layout.isClipped(levelDB: .nan) {
+            failures.append("RTA clipping is not marked from -0.1 dB")
+        }
+        if Layout.frequencyLabel(20) != "20 Hz" || Layout.frequencyLabel(1_000) != "1 kHz"
+            || Layout.frequencyLabel(2_500) != "2.5 kHz" {
+            failures.append("RTA frequency labels differ from the spectrogram axis")
+        }
+        let x32 = MixerKind.behringerX32.rtaBandFrequencies
+        if !Layout.compute(frequencies: [], size: CGSize(width: 800, height: 300)).bands.isEmpty
+            || !Layout.compute(frequencies: [0, 100], size: CGSize(width: 800, height: 300)).bands.isEmpty
+            || !Layout.compute(frequencies: x32, size: .zero).bands.isEmpty
+            || !Layout.compute(frequencies: x32, size: CGSize(width: 20, height: 30)).bands.isEmpty {
+            failures.append("RTA bands were placed without frequencies or room")
+        }
+    }
+
+    private static func testRTAText(_ failures: inout [String]) {
+        let full = MixerRTAText.header(for: MixerRTAInfo(source: "Ch01", tap: "Pre", detector: "RMS"))
+        if full != L10n.format("Zdroj: %@", "Ch01") + " · Pre · RMS" {
+            failures.append("RTA header does not list source, tap and detector")
+        }
+        if MixerRTAText.header(for: nil) != nil || MixerRTAText.header(for: MixerRTAInfo()) != nil {
+            failures.append("RTA header was shown without settings")
+        }
+        if MixerRTAText.header(for: MixerRTAInfo(detector: "PEAK")) != "PEAK" {
+            failures.append("Unknown RTA settings were not omitted from the header")
+        }
+        let none = MixerRTAText.header(for: MixerRTAInfo(sourceIsNone: true))
+        if none != L10n.format("Zdroj: %@", L10n.text("žádný")) {
+            failures.append("RTA header does not say that no source is selected")
+        }
+
+        let identity = MixerIdentity(address: "10.0.0.3", name: "X32", model: "X32", firmware: "4")
+        let connected = MixerConnectionController.Phase.connected(identity)
+        let target = PreferredMixer(kind: .behringerX32, name: "FOH")
+        func notice(
+            _ phase: MixerConnectionController.Phase,
+            target: PreferredMixer? = nil,
+            info: MixerRTAInfo? = nil,
+            missing: Bool = false
+        ) -> String? {
+            MixerRTAText.notice(for: phase, target: target, info: info, isRTAMissing: missing)
+        }
+        if notice(connected, info: MixerRTAInfo(source: "Ch01")) != nil
+            || notice(connected, missing: true) != MixerRTAText.noData
+            || notice(connected, info: MixerRTAInfo(sourceIsNone: true)) != MixerRTAText.noSource {
+            failures.append("RTA notices of a connected console are wrong")
+        }
+        if notice(.invalidAddress) != MixerBridgeNotice.invalidAddress
+            || notice(.noSectionsSelected) != nil
+            || notice(.connecting) != nil
+            || notice(.waitingToRetry, target: target) != MixerBridgeNotice.unavailable(target) {
+            failures.append("RTA notices do not follow the meter bridge's connection notices")
+        }
+        if MixerRTAText.accessibilityLabel(header: nil, notice: nil) != AnalysisDisplayMode.rta.title
+            || MixerRTAText.accessibilityLabel(header: "A", notice: "B")
+            != L10n.format("Analyzátor RTA, %@", "A, B") {
+            failures.append("RTA accessibility label does not combine the header and the notice")
         }
     }
 }

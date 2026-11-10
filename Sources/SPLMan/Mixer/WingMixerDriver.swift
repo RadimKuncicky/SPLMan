@@ -72,10 +72,140 @@ final class WingMixerDriver: MixerDriver {
         return definitions
     }()
 
+    /// The console sends 120 analyzer bands, but their frequencies are not
+    /// documented. ASSUMPTION: 1/12 octave from 20 Hz, so that 10 octaves cover
+    /// 20 Hz to 20 kHz. Verify against a console before relying on the axis.
+    static let rtaBandCount = 120
+    static let rtaBandFrequencies: [Double] = (0..<rtaBandCount).map {
+        20 * pow(2, Double($0) / 12)
+    }
+
+    // Parameter hashes of the analyzer settings, chosen on the console and only
+    // ever read, from the same property map as the name nodes below.
+    /// /cfg/rta/rtasrc, an integer from 0 to 76.
+    static let rtaSourceNode: Int32 = 792_206_572
+    /// /cfg/rta/rtatap, text such as PREEQ or POSTEQ.
+    static let rtaTapNode: Int32 = -230_889_283
+    /// /cfg/rta/rtadet, text: PEAK, RMS or AVG.
+    static let rtaDetectorNode: Int32 = 3_015_320
+    static let rtaNodes = [rtaSourceNode, rtaTapNode, rtaDetectorNode]
+
     private var client: WingClient?
     private var active: [WingMeterDefinition] = []
+    private var includeRTA = false
+    /// Index of the analyzer's group in the client's reports.
+    private var rtaGroup: Int?
     private var nameTargets: [Int32: (section: String, strip: Int)] = [:]
     private var namesRevision = 0
+
+    /// Shows that the console is alive when only the analyzer is wanted, so a
+    /// console that sends no analyzer data keeps its connection. Main strips
+    /// exist on every model; their values are not shown.
+    static let livenessGroup = WingMeterGroup(
+        meters: (0..<4).map { WingMeter(kind: .main, index: UInt8($0)) },
+        isRequired: true
+    )
+
+    /// One group per section, in section order, so that a section's group index
+    /// is its index in `active`. The analyzer's group comes last, after the
+    /// liveness group when there is no section.
+    static func meterGroups(
+        for active: [WingMeterDefinition],
+        includeRTA: Bool
+    ) -> (groups: [WingMeterGroup], rtaGroup: Int?) {
+        var groups: [WingMeterGroup] = active.map { definition in
+            // Strips exist on every model; connectors depend on its cards.
+            WingMeterGroup(
+                meters: definition.meters,
+                isRequired: definition.descriptor.stripCount != nil
+            )
+        }
+        guard includeRTA else { return (groups, nil) }
+        if active.isEmpty {
+            groups.append(livenessGroup)
+        }
+        groups.append(WingMeterGroup(meters: [.rta], isRequired: false))
+        return (groups, groups.count - 1)
+    }
+
+    /// Levels of the sections, from the groups with the same index; groups
+    /// after the sections are not shown.
+    static func levels(
+        for active: [WingMeterDefinition],
+        reports: [[Int16]]
+    ) -> (levels: [String: [Float]], stripCounts: [String: Int]) {
+        var levels: [String: [Float]] = [:]
+        var stripCounts: [String: Int] = [:]
+        for (group, definition) in active.enumerated() where group < reports.count {
+            let words = reports[group]
+            guard !words.isEmpty else { continue }
+            let sectionLevels = definition.levels(from: words)
+            levels[definition.descriptor.id] = sectionLevels
+            if definition.descriptor.stripCount == nil {
+                stripCounts[definition.descriptor.id] =
+                    sectionLevels.count / definition.descriptor.barsPerStrip
+            }
+        }
+        return (levels, stripCounts)
+    }
+
+    /// Analyzer levels of the RTA group's words, in 1/256 dB like other meters.
+    /// Nil when the console sent none; more than the expected bands are cut off.
+    static func rtaFrame(from words: [Int16]) -> MixerRTAFrame? {
+        guard !words.isEmpty else { return nil }
+        return MixerRTAFrame(levels: words.prefix(rtaBandCount).map { Float($0) / 256 })
+    }
+
+    /// The strip an analyzer source index names. DERIVED, not documented for
+    /// this parameter: 1 to 76 are taken to be the console's 76 strips in their
+    /// usual order (40 channels, 8 aux, 16 buses, 4 mains, 8 matrices), as for
+    /// the selected strip. Nil for 0 (no source) and unknown values.
+    static func rtaSourceLabel(_ index: Int32) -> String? {
+        let number = Int(index)
+        switch number {
+        case 1...40: return "CH \(number)"
+        case 41...48: return "AUX \(number - 40)"
+        case 49...64: return "BUS \(number - 48)"
+        case 65...68: return "MAIN \(number - 64)"
+        case 69...76: return "MTX \(number - 68)"
+        default: return nil
+        }
+    }
+
+    /// Tap points are shown as the console names them, except the equalizer
+    /// taps, which the application names in the user's language.
+    static func rtaTapLabel(_ text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch trimmed.uppercased() {
+        case "": return nil
+        case "PREEQ": return L10n.text("Před EQ")
+        case "POSTEQ": return L10n.text("Po EQ")
+        default: return trimmed
+        }
+    }
+
+    static func rtaInfo(values: [Int32: WingNodeValue.Value]) -> MixerRTAInfo {
+        var info = MixerRTAInfo()
+        switch values[rtaSourceNode] {
+        case .integer(let index)?:
+            info.sourceIsNone = index == 0
+            info.source = rtaSourceLabel(index)
+        case .text(let text)?:
+            // Not expected for this node; shown as received.
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            info.source = trimmed.isEmpty ? nil : trimmed
+        case nil:
+            break
+        }
+        if case .text(let text)? = values[rtaTapNode] {
+            info.tap = rtaTapLabel(text)
+        }
+        if case .text(let text)? = values[rtaDetectorNode] {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            info.detector = trimmed.isEmpty ? nil : trimmed
+        }
+        return info
+    }
 
     /// Accepts only the discovery reply of the selected console; nil accepts
     /// the first console that answers.
@@ -95,9 +225,11 @@ final class WingMixerDriver: MixerDriver {
     func start(
         address: String?,
         target: PreferredMixer?,
-        sections: [MixerMeterSectionDescriptor]
+        sections: [MixerMeterSectionDescriptor],
+        includeRTA: Bool
     ) {
         stop()
+        self.includeRTA = includeRTA
         let requested = Set(sections.map(\.id))
         active = Self.definitions.filter { requested.contains($0.descriptor.id) }
         nameTargets = [:]
@@ -106,16 +238,13 @@ final class WingMixerDriver: MixerDriver {
                 nameTargets[id] = (definition.descriptor.id, strip)
             }
         }
+        let groups = Self.meterGroups(for: active, includeRTA: includeRTA)
+        rtaGroup = groups.rtaGroup
         let client = WingClient(
             address: address,
-            meterGroups: active.map { definition in
-                // Strips exist on every model; connectors depend on its cards.
-                WingMeterGroup(
-                    meters: definition.meters,
-                    isRequired: definition.descriptor.stripCount != nil
-                )
-            },
+            meterGroups: groups.groups,
             nameNodes: active.flatMap(\.nameIDs),
+            valueNodes: includeRTA ? Self.rtaNodes : [],
             discoveryFilter: address == nil ? Self.discoveryFilter(for: target) : nil
         )
         self.client = client
@@ -143,15 +272,15 @@ final class WingMixerDriver: MixerDriver {
             )),
             secondsSinceMeterData: snapshot.secondsSinceMeterData
         )
-        for (group, definition) in active.enumerated() where group < snapshot.reports.count {
-            let words = snapshot.reports[group]
-            guard !words.isEmpty else { continue }
-            let levels = definition.levels(from: words)
-            update.levels[definition.descriptor.id] = levels
-            if definition.descriptor.stripCount == nil {
-                update.stripCounts[definition.descriptor.id] =
-                    levels.count / definition.descriptor.barsPerStrip
+        let sectionLevels = Self.levels(for: active, reports: snapshot.reports)
+        update.levels = sectionLevels.levels
+        update.stripCounts = sectionLevels.stripCounts
+        if includeRTA {
+            // An absent or empty group has no levels.
+            if let group = rtaGroup, group < snapshot.reports.count {
+                update.rta = Self.rtaFrame(from: snapshot.reports[group])
             }
+            update.rtaInfo = Self.rtaInfo(values: snapshot.values)
         }
 
         if snapshot.namesRevision != namesRevision {

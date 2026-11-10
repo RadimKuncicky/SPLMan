@@ -97,6 +97,12 @@ public enum X32Protocol {
 
     private static let meterAddressPrefix = "/meters/"
 
+    /// The meter page of the console's real-time analyzer. Some effects, such
+    /// as the graphic equalizers, use it too.
+    public static let rtaPage = 15
+    /// Bands of the real-time analyzer, lowest first.
+    public static let rtaBandCount = 100
+
     public static var infoRequest: [UInt8] { read(infoAddress) }
     public static var xinfoRequest: [UInt8] { read(xinfoAddress) }
 
@@ -125,6 +131,21 @@ public enum X32Protocol {
         guard count <= UInt32((blob.count - 4) / 4) else { return nil }
         return (0..<Int(count)).map {
             Float(bitPattern: littleEndianWord(blob, at: 4 + $0 * 4))
+        }
+    }
+
+    /// The analyzer page holds a little-endian count of 50 words and then 50
+    /// little-endian words, each carrying two successive bands as little-endian
+    /// signed 16-bit values in 1/256 dB, the lower half first. Returns the band
+    /// levels in dB, from -128 dB to 0 dB (clipping), or nil for another blob.
+    public static func rtaLevels(blob: [UInt8]) -> [Float]? {
+        let wordCount = rtaBandCount / 2
+        guard blob.count >= 4 + wordCount * 4,
+              littleEndianWord(blob, at: 0) == UInt32(wordCount) else { return nil }
+        return (0..<rtaBandCount).map { band in
+            let offset = 4 + band * 2
+            let raw = UInt16(blob[offset]) | UInt16(blob[offset + 1]) << 8
+            return Float(Int16(bitPattern: raw)) / 256
         }
     }
 

@@ -55,8 +55,10 @@ final class MeterModel: ObservableObject {
                     displayedMetrics: settings.displayedMetrics
                 )
             }
-            if oldValue.mixer != settings.mixer {
-                mixerBridge.apply(settings.mixer)
+            let includesRTA = settings.spectrogram.displayMode == .rta
+            if oldValue.mixer != settings.mixer
+                || (oldValue.spectrogram.displayMode == .rta) != includesRTA {
+                mixerBridge.apply(settings.mixer, includeRTA: includesRTA)
             }
             if oldValue.wireless != settings.wireless {
                 wirelessMonitor.apply(settings.wireless)
@@ -120,14 +122,18 @@ final class MeterModel: ObservableObject {
         recordingMetadata = historyStore.loadMetadata()
         alarmSettings = historyStore.loadAlarmSettings()
         recordingHistory = historyStore.loadHistory()
-        if settings.spectrogram.displayMode == .meterBridge, settings.mixer.kind == .none {
+        if [.meterBridge, .rta].contains(settings.spectrogram.displayMode),
+           settings.mixer.kind == .none {
             settings.spectrogram.displayMode = .none
         }
         if settings.spectrogram.displayMode == .wireless, !settings.wireless.isEnabled {
             settings.spectrogram.displayMode = .none
         }
         engine.setSpectrogramCaptureEnabled(settings.spectrogram.displayMode.usesAudioAnalysis)
-        mixerBridge.apply(settings.mixer)
+        mixerBridge.apply(
+            settings.mixer,
+            includeRTA: settings.spectrogram.displayMode == .rta
+        )
         wirelessMonitor.apply(settings.wireless)
         refreshDevices()
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
@@ -242,12 +248,13 @@ final class MeterModel: ObservableObject {
         setAnalysisDisplayMode(mode)
     }
 
-    /// The meter bridge is offered only once a mixing console is configured, and
-    /// the wireless view only once monitoring is switched on.
+    /// The meter bridge and the console's analyzer are offered only once a
+    /// mixing console is configured, and the wireless view only once monitoring
+    /// is switched on.
     var availableAnalysisDisplayModes: [AnalysisDisplayMode] {
         AnalysisDisplayMode.allCases.filter {
             switch $0 {
-            case .meterBridge: settings.mixer.kind != .none
+            case .meterBridge, .rta: settings.mixer.kind != .none
             case .wireless: settings.wireless.isEnabled
             case .spectrogram, .transferFunction, .combined, .none: true
             }
@@ -277,7 +284,7 @@ final class MeterModel: ObservableObject {
             mixer.preferredConsole = nil
         }
         settings.mixer = mixer
-        if kind == .none, settings.spectrogram.displayMode == .meterBridge {
+        if kind == .none, [.meterBridge, .rta].contains(settings.spectrogram.displayMode) {
             settings.spectrogram.displayMode = .none
         }
     }

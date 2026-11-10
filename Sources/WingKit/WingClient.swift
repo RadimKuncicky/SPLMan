@@ -24,6 +24,8 @@ public final class WingClient {
         public let names: [Int32: String]
         /// Changes whenever `names` changes.
         public let namesRevision: Int
+        /// Latest value of each requested value node that has answered.
+        public let values: [Int32: WingNodeValue.Value]
     }
 
     private static let discoveryInterval: TimeInterval = 1
@@ -46,6 +48,8 @@ public final class WingClient {
     private let meterGroups: [WingMeterGroup]
     private let nameNodes: [Int32]
     private let nameNodeSet: Set<Int32>
+    private let valueNodes: [Int32]
+    private let valueNodeSet: Set<Int32>
     /// Nil to connect to the first console that answers discovery.
     private let discoveryFilter: ((WingConsoleInfo) -> Bool)?
 
@@ -58,6 +62,7 @@ public final class WingClient {
     private var reports: [[Int16]]
     private var names: [Int32: String] = [:]
     private var namesRevision = 0
+    private var values: [Int32: WingNodeValue.Value] = [:]
 
     private var socket: ConsoleUDPSocket?
     private var connection: NWConnection?
@@ -77,6 +82,8 @@ public final class WingClient {
     ///   - address: The console's address, or nil to find it by broadcast.
     ///   - meterGroups: The values of each group are kept apart in `Snapshot.reports`.
     ///   - nameNodes: Text parameters to read and keep current.
+    ///   - valueNodes: Text or integer parameters to read with every meter
+    ///     renewal, so that changes made on the console show up.
     ///   - discoveryFilter: Without an address, only a console whose discovery
     ///     reply it accepts is connected; replies of other consoles are ignored
     ///     and the attempt fails if no accepted console answers. Called on the
@@ -85,13 +92,16 @@ public final class WingClient {
         address: String?,
         meterGroups: [WingMeterGroup],
         nameNodes: [Int32],
+        valueNodes: [Int32] = [],
         discoveryFilter: ((WingConsoleInfo) -> Bool)? = nil
     ) {
         self.address = address
         self.meterGroups = meterGroups
         self.nameNodes = nameNodes
+        self.valueNodes = valueNodes
         self.discoveryFilter = address == nil ? discoveryFilter : nil
         nameNodeSet = Set(nameNodes)
+        valueNodeSet = Set(valueNodes)
         reports = Array(repeating: [], count: meterGroups.count)
         measurement = WingGroupMeasurement(groups: meterGroups)
     }
@@ -122,7 +132,8 @@ public final class WingClient {
                 },
                 reports: reports,
                 names: names,
-                namesRevision: namesRevision
+                namesRevision: namesRevision,
+                values: values
             )
         }
     }
@@ -314,7 +325,8 @@ public final class WingClient {
             return
         }
         transmit(
-            WingProtocol.selectControlChannel + WingProtocol.meterPort(meterPort) + nameRequests()
+            WingProtocol.selectControlChannel + WingProtocol.meterPort(meterPort)
+                + nameRequests() + valueRequests()
         )
         receiveStream()
         perform(measurement.start())
@@ -364,7 +376,8 @@ public final class WingClient {
     }
 
     private func renewMeters() {
-        var message = WingProtocol.meterRenewal(reportID: Self.combinedReportID)
+        // The renewal ends on the control channel, which node requests need.
+        var message = WingProtocol.meterRenewal(reportID: Self.combinedReportID) + valueRequests()
         renewalsSinceNameRefresh += 1
         if renewalsSinceNameRefresh >= Self.renewalsPerNameRefresh {
             renewalsSinceNameRefresh = 0
@@ -375,6 +388,10 @@ public final class WingClient {
 
     private func nameRequests() -> [UInt8] {
         nameNodes.flatMap { WingProtocol.nodeDataRequest(node: $0) }
+    }
+
+    private func valueRequests() -> [UInt8] {
+        valueNodes.flatMap { WingProtocol.nodeDataRequest(node: $0) }
     }
 
     private func transmit(_ bytes: [UInt8]) {
@@ -392,7 +409,7 @@ public final class WingClient {
             [weak self] data, _, isComplete, error in
             guard let self, self.connection != nil else { return }
             if let data, !data.isEmpty {
-                self.applyNames(self.parser.consume([UInt8](data)))
+                self.applyValues(self.parser.consumeValues([UInt8](data)))
             }
             if let error {
                 self.fail("receive failed: \(error)")
@@ -404,10 +421,17 @@ public final class WingClient {
         }
     }
 
-    private func applyNames(_ values: [WingNodeText]) {
-        for value in values where nameNodeSet.contains(value.node) && names[value.node] != value.text {
-            names[value.node] = value.text
-            namesRevision += 1
+    private func applyValues(_ received: [WingNodeValue]) {
+        for value in received {
+            if valueNodeSet.contains(value.node) {
+                values[value.node] = value.value
+            }
+            if case .text(let text) = value.value,
+               nameNodeSet.contains(value.node),
+               names[value.node] != text {
+                names[value.node] = text
+                namesRevision += 1
+            }
         }
     }
 }

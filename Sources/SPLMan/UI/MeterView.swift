@@ -46,6 +46,16 @@ struct MeterView: View {
                         .allowsHitTesting(false)
                 }
 
+                if model.settings.spectrogram.displayMode == .rta {
+                    // Its header and notice stay readable by accessibility.
+                    MixerRTAView(
+                        bridge: model.mixerBridge,
+                        bandFrequencies: model.settings.mixer.kind.rtaBandFrequencies
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .allowsHitTesting(false)
+                }
+
                 if model.settings.spectrogram.displayMode == .wireless {
                     WirelessMonitorView(monitor: model.wirelessMonitor)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -748,6 +758,7 @@ private struct ClockColumn: View {
         case .transferFunction: "waveform.path.ecg"
         case .combined: "waveform.path.ecg"
         case .meterBridge: "slider.vertical.3"
+        case .rta: "chart.bar"
         case .wireless: "antenna.radiowaves.left.and.right"
         case .none: "eye.slash"
         }
@@ -759,6 +770,7 @@ private struct ClockColumn: View {
         case .transferFunction: "TF"
         case .combined: "TF+SPEC"
         case .meterBridge: "MTR"
+        case .rta: "RTA"
         case .wireless: "MIC"
         case .none: "—"
         }

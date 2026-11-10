@@ -24,8 +24,14 @@ public final class X32Client {
         public let secondsSinceMeterData: TimeInterval?
         /// Age of each meter page received so far.
         public let secondsSinceMeterPage: [Int: TimeInterval]
-        /// Latest linear values of each requested meter page.
+        /// Latest linear values of each requested meter page, except the
+        /// analyzer page, whose levels are in `rtaLevels`.
         public let meterPages: [Int: [Float]]
+        /// Latest band levels in dB of the analyzer page, nil until it arrives.
+        /// Its age is `secondsSinceMeterPage[X32Protocol.rtaPage]`.
+        public let rtaLevels: [Float]?
+        /// Latest integer value of each requested parameter that has answered.
+        public let parameters: [String: Int32]
         public let names: [String: String]
         /// Changes whenever `names` changes.
         public let namesRevision: Int
@@ -48,6 +54,8 @@ public final class X32Client {
     private let meterPages: [Int]
     private let nameAddresses: [String]
     private let nameAddressSet: Set<String>
+    private let parameterAddresses: [String]
+    private let parameterAddressSet: Set<String>
     /// Nil to use the first console that answers discovery.
     private let discoveryFilter: ((X32ConsoleInfo, String) -> Bool)?
 
@@ -60,6 +68,8 @@ public final class X32Client {
     private var firmware = ""
     private var meterPageReceivedAt: [Int: TimeInterval] = [:]
     private var meterValues: [Int: [Float]] = [:]
+    private var rtaLevels: [Float]?
+    private var parameters: [String: Int32] = [:]
     private var names: [String: String] = [:]
     private var namesRevision = 0
 
@@ -76,6 +86,8 @@ public final class X32Client {
     ///     `:port` (see `X32Endpoint`), or nil to find it by broadcast.
     ///   - meterPages: The `/meters/<page>` pages to receive.
     ///   - nameAddresses: Text parameters to read and keep current.
+    ///   - parameterAddresses: Integer parameters to read with every meter
+    ///     renewal, so that changes made on the console show up.
     ///   - discoveryFilter: Without an address, discovery asks for `/xinfo`
     ///     and only a console whose reply it accepts, given with the reply's
     ///     sender address, is used; other consoles are ignored and the attempt
@@ -85,6 +97,7 @@ public final class X32Client {
         address: String?,
         meterPages: [Int],
         nameAddresses: [String],
+        parameterAddresses: [String] = [],
         discoveryFilter: ((_ info: X32ConsoleInfo, _ sender: String) -> Bool)? = nil
     ) {
         configuredAddress = address
@@ -93,6 +106,8 @@ public final class X32Client {
         self.meterPages = meterPages
         self.nameAddresses = nameAddresses
         nameAddressSet = Set(nameAddresses)
+        self.parameterAddresses = parameterAddresses
+        parameterAddressSet = Set(parameterAddresses)
         self.discoveryFilter = address == nil ? discoveryFilter : nil
     }
 
@@ -121,6 +136,8 @@ public final class X32Client {
                 secondsSinceMeterData: pageAges.values.min(),
                 secondsSinceMeterPage: pageAges,
                 meterPages: meterValues,
+                rtaLevels: rtaLevels,
+                parameters: parameters,
                 names: names,
                 namesRevision: namesRevision
             )
@@ -288,6 +305,7 @@ public final class X32Client {
         // Read-only; names the console for the application's status.
         sendToConsole(X32Protocol.xinfoRequest)
         requestMeters()
+        requestParameters()
         requestNames()
         renewalTimer = makeTimer(interval: Self.renewalInterval) { [weak self] in
             self?.renew()
@@ -299,6 +317,7 @@ public final class X32Client {
 
     private func renew() {
         requestMeters()
+        requestParameters()
         renewalsSinceNameRefresh += 1
         if renewalsSinceNameRefresh >= Self.renewalsPerNameRefresh {
             renewalsSinceNameRefresh = 0
@@ -309,6 +328,13 @@ public final class X32Client {
     private func requestMeters() {
         for page in meterPages {
             sendToConsole(X32Protocol.meterRequest(page: page))
+        }
+    }
+
+    /// Reads only: a message without arguments cannot change a parameter.
+    private func requestParameters() {
+        for address in parameterAddresses {
+            sendToConsole(X32Protocol.read(address))
         }
     }
 
@@ -325,9 +351,15 @@ public final class X32Client {
 
     private func apply(_ message: X32Message) {
         if let page = X32Protocol.meterPage(address: message.address) {
-            guard case .blob(let blob)? = message.arguments.first,
-                  let values = X32Protocol.meterValues(blob: blob) else { return }
-            meterValues[page] = values
+            guard case .blob(let blob)? = message.arguments.first else { return }
+            if page == X32Protocol.rtaPage {
+                // Signed 16-bit levels in dB rather than linear floats.
+                guard let levels = X32Protocol.rtaLevels(blob: blob) else { return }
+                rtaLevels = levels
+            } else {
+                guard let values = X32Protocol.meterValues(blob: blob) else { return }
+                meterValues[page] = values
+            }
             meterPageReceivedAt[page] = ProcessInfo.processInfo.systemUptime
             return
         }
@@ -351,7 +383,11 @@ public final class X32Client {
                 firmware = info.firmware
             }
         default:
-            if nameAddressSet.contains(message.address),
+            if parameterAddressSet.contains(message.address) {
+                if case .int(let value)? = message.arguments.first {
+                    parameters[message.address] = value
+                }
+            } else if nameAddressSet.contains(message.address),
                let name = texts.first,
                names[message.address] != name {
                 names[message.address] = name

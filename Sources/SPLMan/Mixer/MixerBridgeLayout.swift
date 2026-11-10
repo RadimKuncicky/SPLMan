@@ -24,30 +24,50 @@ enum MixerMeterScale {
     private static let smallestRedTopDB = 0.75
 
     static func fraction(_ levelDB: Double) -> Double {
+        fraction(levelDB, minimumDB: minimumDB, maximumDB: maximumDB)
+    }
+
+    /// The fraction of a scale from `minimumDB` to `maximumDB`.
+    static func fraction(_ levelDB: Double, minimumDB: Double, maximumDB: Double) -> Double {
         min(1, max(0, (levelDB - minimumDB) / (maximumDB - minimumDB)))
     }
 
+    /// The zone a level falls in, consistent with `segments`.
+    static func zone(levelDB: Double) -> Zone {
+        if levelDB >= redStartDB { return .red }
+        if levelDB > yellowStartDB { return .yellow }
+        return .green
+    }
+
     static func segments(levelDB: Double) -> [Segment] {
+        segments(levelDB: levelDB, minimumDB: minimumDB, maximumDB: maximumDB)
+    }
+
+    /// The same zones on another scale, such as the console analyzer's.
+    static func segments(levelDB: Double, minimumDB: Double, maximumDB: Double) -> [Segment] {
+        func position(_ level: Double) -> Double {
+            fraction(level, minimumDB: minimumDB, maximumDB: maximumDB)
+        }
         guard levelDB.isFinite, levelDB > minimumDB else { return [] }
         var segments = [
             Segment(
                 zone: .green,
                 lower: 0,
-                upper: fraction(min(levelDB, yellowStartDB))
+                upper: position(min(levelDB, yellowStartDB))
             )
         ]
         if levelDB > yellowStartDB {
             segments.append(Segment(
                 zone: .yellow,
-                lower: fraction(yellowStartDB),
-                upper: fraction(min(levelDB, redStartDB))
+                lower: position(yellowStartDB),
+                upper: position(min(levelDB, redStartDB))
             ))
         }
         if levelDB >= redStartDB {
             segments.append(Segment(
                 zone: .red,
-                lower: fraction(redStartDB),
-                upper: fraction(max(levelDB, smallestRedTopDB))
+                lower: position(redStartDB),
+                upper: position(max(levelDB, smallestRedTopDB))
             ))
         }
         return segments

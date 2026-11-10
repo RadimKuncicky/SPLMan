@@ -250,3 +250,11 @@
 "Tento model není podporován." = "Dieses Modell wird nicht unterstützt.";
 "Nedostupný. Připojení se opakuje automaticky." = "Nicht erreichbar. Die Verbindung wird automatisch wiederholt.";
 "Přijímače ULX-D, SLX-D a QLX-D se hledají automaticky podle toho, co samy oznamují v síti. Pokud se některý nenajde, zadejte jeho IP adresu (více adres oddělte čárkou) nebo prohledejte síť: aplikace se pak zeptá všech adres ve vaší podsíti /24 na portu 2202. Z přijímačů se jen čte a nic se v nich nemění." = "ULX-D-, SLX-D- und QLX-D-Empfänger werden automatisch anhand ihrer eigenen Netzwerkmeldungen gefunden. Wird einer nicht gefunden, geben Sie seine IP-Adresse ein (mehrere durch Kommas getrennt) oder durchsuchen Sie das Netzwerk: Die App fragt dann alle Adressen Ihres /24-Subnetzes auf Port 2202 ab. Die Empfänger werden nur gelesen und nie verändert.";
+"RTA mixpultu" = "RTA des Mischpults";
+"Zdroj: %@" = "Quelle: %@";
+"Před EQ" = "Pre-EQ";
+"Po EQ" = "Post-EQ";
+"žádný" = "keine";
+"Mixpult neposílá data RTA. Zkontrolujte nastavení RTA na pultu." = "Das Mischpult sendet keine RTA-Daten. Prüfen Sie die RTA-Einstellungen am Mischpult.";
+"Na pultu není vybrán zdroj RTA." = "Am Mischpult ist keine RTA-Quelle ausgewählt.";
+"Analyzátor RTA, %@" = "RTA-Analysator, %@";

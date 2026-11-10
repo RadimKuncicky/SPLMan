@@ -123,6 +123,8 @@ enum AnalysisDisplayMode: String, CaseIterable, Codable, Identifiable {
     case transferFunction
     case combined
     case meterBridge
+    /// The mixing console's real-time analyzer.
+    case rta
     case wireless
     case none
 
@@ -134,6 +136,7 @@ enum AnalysisDisplayMode: String, CaseIterable, Codable, Identifiable {
         case .transferFunction: L10n.text("Přenosová charakteristika")
         case .combined: L10n.text("Přenosová charakteristika a spektrogram")
         case .meterBridge: L10n.text("Meter bridge")
+        case .rta: L10n.text("RTA mixpultu")
         case .wireless: L10n.text("Bezdrátové mikrofony")
         case .none: L10n.text("Nic")
         }
@@ -156,7 +159,8 @@ enum AnalysisDisplayMode: String, CaseIterable, Codable, Identifiable {
         case .spectrogram: .transferFunction
         case .transferFunction: .combined
         case .combined: .meterBridge
-        case .meterBridge: .wireless
+        case .meterBridge: .rta
+        case .rta: .wireless
         case .wireless: .none
         case .none: .spectrogram
         }

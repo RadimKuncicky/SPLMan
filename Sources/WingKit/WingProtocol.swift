@@ -12,9 +12,18 @@ public struct WingMeter: Equatable {
         case dca = 0xa5
         case source = 0xa7
         case output = 0xa8
+        /// The real-time analyzer, which has no index.
+        case rta = 0xaa
+
+        /// Whether a request names a block of this kind by an index byte.
+        public var hasIndex: Bool { self != .rta }
     }
 
+    /// The band levels of the console's real-time analyzer.
+    public static let rta = WingMeter(kind: .rta, index: 0)
+
     public let kind: Kind
+    /// Ignored for kinds without an index.
     public let index: UInt8
 
     public init(kind: Kind, index: UInt8) {
@@ -219,7 +228,9 @@ public enum WingProtocol {
         payload.append(0xdc)
         for meter in meters {
             payload.append(meter.kind.rawValue)
-            payload.append(meter.index)
+            if meter.kind.hasIndex {
+                payload.append(meter.index)
+            }
         }
         payload.append(0xde)
         return meterMessage(payload)
@@ -276,15 +287,28 @@ public struct WingNodeText: Equatable {
     public let text: String
 }
 
+/// A text or integer value of a console parameter received on the TCP stream.
+public struct WingNodeValue: Equatable {
+    public enum Value: Equatable {
+        case text(String)
+        case integer(Int32)
+    }
+
+    public let node: Int32
+    public let value: Value
+}
+
 /// Incremental decoder of the console's TCP stream. Chunks may split anywhere.
-/// Only text values are reported, because that is all the bridge needs; other
-/// values are skipped according to their token.
+/// Text and integer values are reported; other values, such as floats, are
+/// skipped according to their token.
 public struct WingStreamParser {
     private enum State {
         case token
         case skipping(Int)
         case textLength
         case text(remaining: Int)
+        /// A big-endian signed integer of `width` bytes.
+        case integer(remaining: Int, width: Int)
         case nodeHash(remaining: Int)
         case definitionLength(remaining: Int)
         case definitionLongLength(remaining: Int)
@@ -304,8 +328,18 @@ public struct WingStreamParser {
 
     public init() {}
 
+    /// The text values only.
     public mutating func consume(_ bytes: [UInt8]) -> [WingNodeText] {
-        var results: [WingNodeText] = []
+        consumeValues(bytes).compactMap { value -> WingNodeText? in
+            if case .text(let text) = value.value {
+                return WingNodeText(node: value.node, text: text)
+            }
+            return nil
+        }
+    }
+
+    public mutating func consumeValues(_ bytes: [UInt8]) -> [WingNodeValue] {
+        var results: [WingNodeValue] = []
         for byte in bytes {
             for value in unframed(byte) {
                 decode(value, &results)
@@ -338,7 +372,7 @@ public struct WingStreamParser {
         return channel == Self.controlChannel ? output : []
     }
 
-    private mutating func decode(_ byte: UInt8, _ results: inout [WingNodeText]) {
+    private mutating func decode(_ byte: UInt8, _ results: inout [WingNodeValue]) {
         switch state {
         case .token:
             decodeToken(byte, &results)
@@ -352,7 +386,18 @@ public struct WingStreamParser {
             if remaining > 1 {
                 state = .text(remaining: remaining - 1)
             } else {
-                emit(String(decoding: textBytes, as: UTF8.self), &results)
+                emit(.text(String(decoding: textBytes, as: UTF8.self)), &results)
+                state = .token
+            }
+        case .integer(let remaining, let width):
+            accumulator = accumulator << 8 | UInt32(byte)
+            if remaining > 1 {
+                state = .integer(remaining: remaining - 1, width: width)
+            } else {
+                let value = width == 2
+                    ? Int32(Int16(bitPattern: UInt16(truncatingIfNeeded: accumulator)))
+                    : Int32(bitPattern: accumulator)
+                emit(.integer(value), &results)
                 state = .token
             }
         case .nodeHash(let remaining):
@@ -382,8 +427,11 @@ public struct WingStreamParser {
         }
     }
 
-    private mutating func decodeToken(_ token: UInt8, _ results: inout [WingNodeText]) {
+    private mutating func decodeToken(_ token: UInt8, _ results: inout [WingNodeValue]) {
         switch token {
+        case 0x00...0x3f:
+            // False or 0, true or 1, and integers 2 to 63.
+            emit(.integer(Int32(token)), &results)
         case 0x80...0xbf:
             textBytes = []
             state = .text(remaining: Int(token - 0x80) + 1)
@@ -394,15 +442,20 @@ public struct WingStreamParser {
             // a following value belongs to a node this parser does not know.
             currentNode = nil
         case 0xd0:
-            emit("", &results)
+            emit(.text(""), &results)
         case 0xd1:
             state = .textLength
         case 0xd2:
             currentNode = nil
             state = .skipping(2)
         case 0xd3:
-            state = .skipping(2)
-        case 0xd4, 0xd5, 0xd6:
+            accumulator = 0
+            state = .integer(remaining: 2, width: 2)
+        case 0xd4:
+            accumulator = 0
+            state = .integer(remaining: 4, width: 4)
+        case 0xd5, 0xd6:
+            // Floats.
             state = .skipping(4)
         case 0xd7:
             accumulator = 0
@@ -413,13 +466,13 @@ public struct WingStreamParser {
             accumulator = 0
             state = .definitionLength(remaining: 2)
         default:
-            // Integers and other tokens without further bytes.
+            // Other tokens without further bytes.
             break
         }
     }
 
-    private func emit(_ text: String, _ results: inout [WingNodeText]) {
+    private func emit(_ value: WingNodeValue.Value, _ results: inout [WingNodeValue]) {
         guard let currentNode else { return }
-        results.append(WingNodeText(node: currentNode, text: text))
+        results.append(WingNodeValue(node: currentNode, value: value))
     }
 }

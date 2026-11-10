@@ -6,7 +6,8 @@ import Foundation
 final class MixerConnectionController {
     enum Phase: Equatable {
         case disabled
-        /// A console is configured, but every meter bridge section is hidden.
+        /// A console is configured, but every meter bridge section is hidden
+        /// and the analyzer is not wanted.
         case noSectionsSelected
         /// The address cannot be used; nothing is retried until it changes.
         case invalidAddress
@@ -37,21 +38,34 @@ final class MixerConnectionController {
         var meterDataTimeout: TimeInterval = 5
         /// Bars must not stay frozen at the last level while the data is missing.
         var staleLevelsAfter: TimeInterval = 1
+        /// Drivers learn at connection time which analyzer data a console sends,
+        /// so analyzer data missing this long while other meters arrive makes
+        /// the connection start again.
+        var rtaMissingRetryAfter: TimeInterval = 15
     }
 
     private(set) var phase: Phase = .disabled
     private(set) var sections: [MixerBridgeSection] = []
     private(set) var levels: [String: [Float]] = [:]
+    /// Nil while the analyzer is not wanted or its data is missing or stale.
+    private(set) var rta: MixerRTAFrame?
+    private(set) var rtaInfo: MixerRTAInfo?
+    /// The analyzer is wanted, but a connected console has not sent its data
+    /// for a while, so it is not merely about to arrive.
+    private(set) var isRTAMissing = false
 
     private let timing: Timing
     private let makeDriver: (MixerKind) -> MixerDriver?
     private var driver: MixerDriver?
     private var settings = MixerSettings()
+    private var includeRTA = false
     private var descriptors: [MixerMeterSectionDescriptor] = []
     private var stripCounts: [String: Int] = [:]
     private var names: [String: [Int: String]] = [:]
     private var attemptStartedAt: TimeInterval = 0
     private var connectedAt: TimeInterval?
+    /// Since when a live connection has delivered no analyzer data.
+    private var rtaMissingSince: TimeInterval?
     private var retryAt: TimeInterval = 0
 
     init(
@@ -62,14 +76,19 @@ final class MixerConnectionController {
         self.makeDriver = makeDriver
     }
 
-    func configure(_ newSettings: MixerSettings, now: TimeInterval) {
-        guard newSettings != settings || phase == .disabled else { return }
+    /// - Parameter includeRTA: Whether to also read the console's real-time
+    ///   analyzer. A change restarts the connection, like a section change.
+    func configure(_ newSettings: MixerSettings, includeRTA: Bool = false, now: TimeInterval) {
+        guard newSettings != settings
+            || includeRTA != self.includeRTA
+            || phase == .disabled else { return }
         // Names and connector counts belong to one console; retries to the same
         // console keep them, but another console must not show them.
         let consoleChanged = newSettings.kind != settings.kind
             || newSettings.connectionAddress != settings.connectionAddress
             || newSettings.connectionTarget != settings.connectionTarget
         settings = newSettings
+        self.includeRTA = includeRTA
         descriptors = newSettings.visibleSections
         if consoleChanged {
             stripCounts = [:]
@@ -79,7 +98,7 @@ final class MixerConnectionController {
         rebuildSections()
         if newSettings.kind == .none {
             phase = .disabled
-        } else if descriptors.isEmpty {
+        } else if descriptors.isEmpty, !includeRTA {
             phase = .noSectionsSelected
         } else if !newSettings.kind.isValidAddress(newSettings.connectionAddress) {
             phase = .invalidAddress
@@ -126,8 +145,24 @@ final class MixerConnectionController {
                 scheduleRetry(now: now)
                 return
             }
+            let isStale = silence >= timing.staleLevelsAfter
+            if includeRTA, !isStale, update.rta == nil {
+                let missingSince = rtaMissingSince ?? now
+                rtaMissingSince = missingSince
+                if now - missingSince >= timing.rtaMissingRetryAfter {
+                    scheduleRetry(now: now)
+                    return
+                }
+            } else {
+                rtaMissingSince = nil
+            }
             phase = .connected(identity)
-            levels = silence >= timing.staleLevelsAfter ? [:] : update.levels
+            levels = isStale ? [:] : update.levels
+            rta = isStale || !includeRTA ? nil : update.rta
+            rtaInfo = includeRTA ? update.rtaInfo : nil
+            // During a full data outage the connection state explains enough.
+            isRTAMissing = includeRTA && !isStale && rta == nil
+                && now - connectedAt >= timing.staleLevelsAfter
             merge(update)
         }
     }
@@ -176,7 +211,8 @@ final class MixerConnectionController {
         driver.start(
             address: settings.connectionAddress,
             target: settings.connectionTarget,
-            sections: descriptors
+            sections: descriptors,
+            includeRTA: includeRTA
         )
     }
 
@@ -191,5 +227,9 @@ final class MixerConnectionController {
         driver = nil
         connectedAt = nil
         levels = [:]
+        rta = nil
+        rtaInfo = nil
+        isRTAMissing = false
+        rtaMissingSince = nil
     }
 }
