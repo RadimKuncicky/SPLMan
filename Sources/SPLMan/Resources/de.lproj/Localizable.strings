@@ -216,6 +216,8 @@
 "Mixpult není nastaven." = "Kein Mischpult eingerichtet.";
 "Hledám mixpult…" = "Mischpult wird gesucht…";
 "Mixpult není dostupný. Připojení se opakuje automaticky." = "Das Mischpult ist nicht erreichbar. Die Verbindung wird automatisch wiederholt.";
+"Není vybrána žádná sekce meter bridge." = "Kein Meter-Bridge-Bereich ausgewählt.";
+"Adresa mixpultu není platná. Zadejte IPv4 adresu nebo název v síti, případně s portem (např. 192.168.1.20:10023)." = "Die Adresse des Mischpults ist ungültig. Geben Sie eine IPv4-Adresse oder einen Netzwerknamen ein, optional mit Port (z. B. 192.168.1.20:10023).";
 "Připojeno: %@" = "Verbunden: %@";
 "Kanály" = "Kanäle";
 "Aux" = "Aux";

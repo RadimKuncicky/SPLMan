@@ -1,4 +1,5 @@
 import ConsoleSockets
+import Darwin
 import Foundation
 
 /// One read-only metering session with a Behringer X32 or Midas M32 over UDP.
@@ -17,7 +18,10 @@ public final class X32Client {
         public let address: String?
         public let model: String
         public let firmware: String
+        /// Age of the most recent meter page, nil until the first one arrives.
         public let secondsSinceMeterData: TimeInterval?
+        /// Age of each meter page received so far.
+        public let secondsSinceMeterPage: [Int: TimeInterval]
         /// Latest linear values of each requested meter page.
         public let meterPages: [Int: [Float]]
         public let names: [String: String]
@@ -36,15 +40,20 @@ public final class X32Client {
 
     private let queue = DispatchQueue(label: "cz.splman.x32kit", qos: .userInitiated)
     private let configuredAddress: String?
+    /// Nil for automatic discovery and for an address that cannot be parsed.
+    private let endpoint: X32Endpoint?
+    private let consolePort: UInt16
     private let meterPages: [Int]
     private let nameAddresses: [String]
     private let nameAddressSet: Set<String>
 
     private var state = State.connecting
+    /// The configured console's IPv4 address once it is known.
+    private var destination: in_addr?
     private var console: in_addr?
     private var model = ""
     private var firmware = ""
-    private var lastMeterDataAt: TimeInterval?
+    private var meterPageReceivedAt: [Int: TimeInterval] = [:]
     private var meterValues: [Int: [Float]] = [:]
     private var names: [String: String] = [:]
     private var namesRevision = 0
@@ -58,11 +67,14 @@ public final class X32Client {
     private var pendingNames: ArraySlice<String> = []
 
     /// - Parameters:
-    ///   - address: The console's IPv4 address, or nil to find it by broadcast.
+    ///   - address: The console's IPv4 address or host name, optionally with
+    ///     `:port` (see `X32Endpoint`), or nil to find it by broadcast.
     ///   - meterPages: The `/meters/<page>` pages to receive.
     ///   - nameAddresses: Text parameters to read and keep current.
     public init(address: String?, meterPages: [Int], nameAddresses: [String]) {
         configuredAddress = address
+        endpoint = address.flatMap(X32Endpoint.init(parsing:))
+        consolePort = endpoint?.port ?? X32Protocol.port
         self.meterPages = meterPages
         self.nameAddresses = nameAddresses
         nameAddressSet = Set(nameAddresses)
@@ -82,14 +94,15 @@ public final class X32Client {
 
     public func snapshot() -> Snapshot {
         queue.sync {
-            Snapshot(
+            let now = ProcessInfo.processInfo.systemUptime
+            let pageAges = meterPageReceivedAt.mapValues { max(0, now - $0) }
+            return Snapshot(
                 state: state,
                 address: console.map(ConsoleUDPSocket.text(of:)) ?? configuredAddress,
                 model: model,
                 firmware: firmware,
-                secondsSinceMeterData: lastMeterDataAt.map {
-                    max(0, ProcessInfo.processInfo.systemUptime - $0)
-                },
+                secondsSinceMeterData: pageAges.values.min(),
+                secondsSinceMeterPage: pageAges,
                 meterPages: meterValues,
                 names: names,
                 namesRevision: namesRevision
@@ -97,8 +110,24 @@ public final class X32Client {
         }
     }
 
+    /// Whether a reply to `/info` may identify the console. With a configured
+    /// address only that address may answer; discovery takes the first reply.
+    /// A broadcast destination (255.255.255.255 or a subnet broadcast ending in
+    /// 255) is answered from the console's own address, so it acts as discovery.
+    public static func acceptsInfo(from sender: in_addr, expected: in_addr?) -> Bool {
+        guard let expected else { return true }
+        // `s_addr` is in network byte order; the last octet is the low byte
+        // once converted to host order.
+        if UInt32(bigEndian: expected.s_addr) & 0xFF == 0xFF { return true }
+        return expected.s_addr == sender.s_addr
+    }
+
     private func begin() {
         guard state == .connecting, socket == nil else { return }
+        if configuredAddress != nil, endpoint == nil {
+            fail()
+            return
+        }
         socket = ConsoleUDPSocket(queue: queue) { [weak self] datagram, sender in
             self?.handleDatagram(datagram, from: sender)
         }
@@ -106,6 +135,60 @@ public final class X32Client {
             fail()
             return
         }
+        guard let endpoint else {
+            startProbing()
+            return
+        }
+        if let literal = ConsoleUDPSocket.ipv4Address(endpoint.host) {
+            destination = literal
+            startProbing()
+        } else {
+            resolve(endpoint.host)
+        }
+    }
+
+    /// Name resolution can block for seconds, so it runs neither on the main
+    /// thread nor on the client's queue. Nothing is sent until it finishes.
+    private func resolve(_ host: String) {
+        let clientQueue = queue
+        let finish: (in_addr?) -> Void = { [weak self] address in
+            self?.finishResolving(address)
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let address = X32Client.resolveIPv4(host)
+            clientQueue.async { finish(address) }
+        }
+    }
+
+    private func finishResolving(_ address: in_addr?) {
+        // The client may have been stopped while the name was resolved.
+        guard state == .connecting, socket != nil, destination == nil else { return }
+        guard let address else {
+            // A name that is not known yet (for example a `.local` name before
+            // the console appears) fails this attempt; the caller retries later.
+            fail()
+            return
+        }
+        destination = address
+        startProbing()
+    }
+
+    private static func resolveIPv4(_ host: String) -> in_addr? {
+        var hints = addrinfo()
+        hints.ai_family = AF_INET
+        hints.ai_socktype = SOCK_DGRAM
+        var result: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, nil, &hints, &result) == 0, let first = result else { return nil }
+        defer { freeaddrinfo(first) }
+        for info in sequence(first: first, next: { $0.pointee.ai_next }) {
+            guard info.pointee.ai_family == AF_INET,
+                  let address = info.pointee.ai_addr else { continue }
+            return UnsafeRawPointer(address).load(as: sockaddr_in.self).sin_addr
+        }
+        return nil
+    }
+
+    private func startProbing() {
         sendProbe()
         probeTimer = makeTimer(interval: Self.probeInterval) { [weak self] in
             self?.sendProbe()
@@ -146,12 +229,9 @@ public final class X32Client {
             return
         }
         probesSent += 1
-        if let configuredAddress {
-            guard let destination = ConsoleUDPSocket.ipv4Address(configuredAddress) else {
-                fail()
-                return
-            }
-            socket?.send(X32Protocol.infoRequest, to: destination, port: X32Protocol.port)
+        if endpoint != nil {
+            guard let destination else { return }
+            socket?.send(X32Protocol.infoRequest, to: destination, port: consolePort)
         } else {
             socket?.broadcast(X32Protocol.infoRequest, port: X32Protocol.port)
         }
@@ -159,14 +239,17 @@ public final class X32Client {
 
     private func sendToConsole(_ bytes: [UInt8]) {
         guard let console else { return }
-        socket?.send(bytes, to: console, port: X32Protocol.port)
+        socket?.send(bytes, to: console, port: consolePort)
     }
 
     private func handleDatagram(_ datagram: [UInt8], from sender: in_addr) {
         if let console, console.s_addr != sender.s_addr { return }
         guard let message = X32Message(packet: datagram) else { return }
         if console == nil {
-            guard message.address == X32Protocol.infoAddress else { return }
+            // A configured console that is still being resolved cannot answer yet.
+            if endpoint != nil, destination == nil { return }
+            guard message.address == X32Protocol.infoAddress,
+                  Self.acceptsInfo(from: sender, expected: destination) else { return }
             console = sender
             subscribe()
         }
@@ -218,7 +301,7 @@ public final class X32Client {
             guard case .blob(let blob)? = message.arguments.first,
                   let values = X32Protocol.meterValues(blob: blob) else { return }
             meterValues[page] = values
-            lastMeterDataAt = ProcessInfo.processInfo.systemUptime
+            meterPageReceivedAt[page] = ProcessInfo.processInfo.systemUptime
             return
         }
 

@@ -575,7 +575,8 @@ enum SelfTest {
                 failures.append("Settings test could not inspect the encoded property list")
                 return
             }
-            spectrogram["displayMode"] = "valueFromNewerVersion"
+            // The display mode has its own fallback, so another strict field is used.
+            spectrogram["frequencyRange"] = "valueFromNewerVersion"
             root["spectrogram"] = spectrogram
             let corrupted = try PropertyListSerialization.data(
                 fromPropertyList: root,

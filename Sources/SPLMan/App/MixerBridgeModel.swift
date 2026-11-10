@@ -22,10 +22,10 @@ final class MixerBridgeModel: ObservableObject {
         queue.async { [weak self] in
             guard let self else { return }
             self.controller.configure(settings, now: Self.now)
-            if self.controller.phase == .disabled {
-                self.stopTimer()
-            } else {
+            if self.controller.phase.isActive {
                 self.startTimer()
+            } else {
+                self.stopTimer()
             }
             self.publishChanges()
         }

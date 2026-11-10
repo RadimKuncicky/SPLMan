@@ -988,7 +988,7 @@ private struct MixerStatusLine: View {
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Circle()
-                .fill(bridge.phase.isConnected ? Color.green : Color.secondary)
+                .fill(statusColor)
                 .frame(width: 8, height: 8)
             Text(statusText)
                 .font(.callout)
@@ -997,10 +997,25 @@ private struct MixerStatusLine: View {
         }
     }
 
+    private var statusColor: Color {
+        switch bridge.phase {
+        case .connected:
+            return .green
+        case .invalidAddress:
+            return .orange
+        case .disabled, .noSectionsSelected, .connecting, .waitingToRetry:
+            return .secondary
+        }
+    }
+
     private var statusText: String {
         switch bridge.phase {
         case .disabled:
             return L10n.text("Mixpult není nastaven.")
+        case .noSectionsSelected:
+            return MixerBridgeNotice.noSections
+        case .invalidAddress:
+            return MixerBridgeNotice.invalidAddress
         case .connecting:
             return L10n.text("Hledám mixpult…")
         case .waitingToRetry:

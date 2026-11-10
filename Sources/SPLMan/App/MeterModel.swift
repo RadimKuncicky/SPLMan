@@ -281,7 +281,7 @@ final class MeterModel: ObservableObject {
 
     func setMixerSection(_ section: MixerMeterSectionDescriptor, isVisible: Bool) {
         guard settings.mixer.isVisible(section) != isVisible else { return }
-        settings.mixer.sectionVisibility[section.id] = isVisible
+        settings.mixer.setVisible(section, isVisible)
     }
 
     func selectReferenceChannel(_ channel: Int?) {

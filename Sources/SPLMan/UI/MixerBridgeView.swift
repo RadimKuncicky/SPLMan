@@ -14,18 +14,50 @@ struct MixerBridgeView: View {
                 size: geometry.size
             )
             ZStack {
-                MixerBridgeLabels(layout: layout)
-                if bridge.phase.isConnected {
-                    TimelineView(.animation(minimumInterval: Self.frameInterval)) { timeline in
-                        MixerBridgeBars(
-                            date: timeline.date,
-                            layout: layout,
-                            levels: bridge.levels
-                        )
+                ZStack {
+                    MixerBridgeLabels(layout: layout)
+                    if bridge.phase.isConnected {
+                        TimelineView(.animation(minimumInterval: Self.frameInterval)) { timeline in
+                            MixerBridgeBars(
+                                date: timeline.date,
+                                layout: layout,
+                                levels: bridge.levels
+                            )
+                        }
                     }
                 }
+                .opacity(bridge.phase.isConnected ? 0.6 : 0.3)
+
+                if let notice = MixerBridgeNotice.text(for: bridge.phase) {
+                    Text(notice)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(24)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .allowsHitTesting(false)
+                }
             }
-            .opacity(bridge.phase.isConnected ? 0.6 : 0.3)
+        }
+    }
+}
+
+/// Explains, on the meter bridge and in Settings, why the bridge cannot show
+/// a configured console.
+enum MixerBridgeNotice {
+    static var noSections: String {
+        L10n.text("Není vybrána žádná sekce meter bridge.")
+    }
+
+    static var invalidAddress: String {
+        L10n.text("Adresa mixpultu není platná. Zadejte IPv4 adresu nebo název v síti, případně s portem (např. 192.168.1.20:10023).")
+    }
+
+    static func text(for phase: MixerConnectionController.Phase) -> String? {
+        switch phase {
+        case .noSectionsSelected: noSections
+        case .invalidAddress: invalidAddress
+        case .disabled, .connecting, .connected, .waitingToRetry: nil
         }
     }
 }

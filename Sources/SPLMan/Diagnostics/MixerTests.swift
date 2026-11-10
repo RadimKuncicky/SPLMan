@@ -29,9 +29,15 @@ enum MixerTests {
         testWingStream(&failures)
         testX32Protocol(&failures)
         testX32Definitions(&failures)
+        testX32Endpoint(&failures)
+        testX32Client(&failures)
+        testX32StaleLevels(&failures)
         testLayout(&failures)
         testSettings(&failures)
+        testSectionVisibilityByKind(&failures)
+        testUnknownDisplayMode(&failures)
         testConnection(&failures)
+        testConnectionWithoutAttempt(&failures)
         return failures
     }
 
@@ -415,6 +421,106 @@ enum MixerTests {
         }
     }
 
+    private static func testX32Endpoint(_ failures: inout [String]) {
+        let valid: [(text: String, host: String, port: UInt16)] = [
+            ("192.168.1.20", "192.168.1.20", X32Protocol.port),
+            (" x32.local ", "x32.local", X32Protocol.port),
+            ("192.168.1.20:10023", "192.168.1.20", 10_023),
+            ("x32.local:10024", "x32.local", 10_024),
+            ("Mixer-1", "Mixer-1", X32Protocol.port),
+            ("x32.example.com.", "x32.example.com", X32Protocol.port),
+            ("X32_Rack", "X32_Rack", X32Protocol.port),
+            ("X32_Rack:10023", "X32_Rack", 10_023)
+        ]
+        for expected in valid {
+            let endpoint = X32Endpoint(parsing: expected.text)
+            if endpoint?.host != expected.host || endpoint?.port != expected.port {
+                failures.append("X32 address \(expected.text) was not read")
+            }
+            if !MixerKind.behringerX32.isValidAddress(expected.text) {
+                failures.append("Valid X32 address \(expected.text) was rejected")
+            }
+        }
+
+        let invalid = [
+            "fe80::1", "[::1]:10023", "host:0", "host:70000", "host:abc", "host:",
+            "a b", "", "x32..local", "-x32.local", "300.1.1.1", "192.168.1",
+            ".", "..", "x32.local..", ".x32.local"
+        ]
+        for text in invalid {
+            if X32Endpoint(parsing: text) != nil {
+                failures.append("Invalid X32 address \(text) was accepted")
+            }
+            if !text.isEmpty, MixerKind.behringerX32.isValidAddress(text) {
+                failures.append("Invalid X32 address \(text) was offered to the driver")
+            }
+        }
+        if !MixerKind.behringerX32.isValidAddress(nil)
+            || !MixerKind.behringerX32.isValidAddress("  ") {
+            failures.append("An empty X32 address must mean automatic discovery")
+        }
+        if !MixerKind.behringerWing.isValidAddress("fe80::1")
+            || !MixerKind.none.isValidAddress("a b") {
+            failures.append("Address validation must apply to X32 only")
+        }
+    }
+
+    private static func testX32Client(_ failures: inout [String]) {
+        let console = in_addr(s_addr: 0x1401_a8c0)
+        let other = in_addr(s_addr: 0x1501_a8c0)
+        if !X32Client.acceptsInfo(from: console, expected: console)
+            || X32Client.acceptsInfo(from: other, expected: console) {
+            failures.append("X32 info reply was accepted from another address than configured")
+        }
+        if !X32Client.acceptsInfo(from: other, expected: nil) {
+            failures.append("X32 discovery did not accept the first info reply")
+        }
+        // 255.255.255.255 and 192.168.1.255 (network byte order in s_addr).
+        let limitedBroadcast = in_addr(s_addr: 0xffff_ffff)
+        let subnetBroadcast = in_addr(s_addr: 0xff01_a8c0)
+        if !X32Client.acceptsInfo(from: other, expected: limitedBroadcast)
+            || !X32Client.acceptsInfo(from: other, expected: subnetBroadcast) {
+            failures.append("X32 broadcast destination did not accept the console's reply")
+        }
+    }
+
+    private static func testX32StaleLevels(_ failures: inout [String]) {
+        let definitions = X32MixerDriver.definitions.filter { ["ch", "main"].contains($0.descriptor.id) }
+        let pages: [Int: [Float]] = [
+            0: [Float](repeating: 1, count: 70),
+            2: [Float](repeating: 1, count: 49)
+        ]
+        let staleAfter = MixerConnectionController.Timing().staleLevelsAfter
+
+        let partly = X32MixerDriver.levels(
+            for: definitions,
+            pages: pages,
+            ages: [0: 0.05, 2: staleAfter],
+            staleAfter: staleAfter
+        )
+        if partly["ch"]?.count != 32 || partly["main"] != nil {
+            failures.append("Levels of a stale X32 meter page stayed on the display")
+        }
+        let fresh = X32MixerDriver.levels(
+            for: definitions,
+            pages: pages,
+            ages: [0: 0.05, 2: staleAfter / 2],
+            staleAfter: staleAfter
+        )
+        if fresh["ch"]?.count != 32 || fresh["main"]?.count != 2 {
+            failures.append("Levels of fresh X32 meter pages were not shown")
+        }
+        let withoutAge = X32MixerDriver.levels(
+            for: definitions,
+            pages: pages,
+            ages: [0: 0.05],
+            staleAfter: staleAfter
+        )
+        if withoutAge["main"] != nil {
+            failures.append("X32 levels without a reception time were shown")
+        }
+    }
+
     private static func section(_ id: String, strips: Int, bars: Int) -> MixerBridgeSection {
         MixerBridgeSection(
             id: id,
@@ -446,19 +552,44 @@ enum MixerTests {
             failures.append("Crowded meter bridge did not wrap into two rows")
         }
 
-        for layout in [oneRow, twoRows] {
+        // Far more sections than fit: rows are limited by the height, then gaps
+        // and bars shrink. The last size cannot hold the bars at their smallest
+        // pitch even without gaps.
+        let many = (0..<30).map { section("s\($0)", strips: 16, bars: 1) }
+        var checked = [(layout: oneRow, size: size), (layout: twoRows, size: size)]
+        for smallSize in [
+            CGSize(width: 600, height: 200),
+            CGSize(width: 300, height: 60),
+            CGSize(width: 200, height: 60)
+        ] {
+            let layout = MixerBridgeLayout.compute(sections: many, size: smallSize)
+            if layout.sections.map(\.id) != many.map(\.id) {
+                failures.append("Not every meter bridge section was placed at \(smallSize)")
+            }
+            if layout.rowCount < 1 || (smallSize.height <= 60 && layout.rowCount != 1) {
+                failures.append("Meter bridge used rows the height cannot hold at \(smallSize)")
+            }
+            checked.append((layout: layout, size: smallSize))
+        }
+
+        for (layout, area) in checked {
             for placed in layout.sections {
                 let outside = placed.bars.contains {
-                    $0.frame.maxX > size.width || $0.frame.maxY > size.height || $0.frame.width <= 0
+                    $0.frame.minX < 0 || $0.frame.minY < 0
+                        || $0.frame.maxX > area.width || $0.frame.maxY > area.height
+                        || $0.frame.width <= 0
                 }
                 if outside {
-                    failures.append("Meter bridge section \(placed.id) left the display")
+                    failures.append("Meter bridge section \(placed.id) left the display at \(area)")
                 }
             }
             for (index, first) in layout.sections.enumerated() {
-                for second in layout.sections[(index + 1)...]
-                where first.frame.intersects(second.frame) {
-                    failures.append("Meter bridge sections \(first.id) and \(second.id) overlap")
+                for second in layout.sections[(index + 1)...] {
+                    // Sections squeezed without gaps may touch, but not overlap.
+                    let overlap = first.frame.intersection(second.frame)
+                    if !overlap.isNull, overlap.width > 0.001, overlap.height > 0.001 {
+                        failures.append("Meter bridge sections \(first.id) and \(second.id) overlap")
+                    }
                 }
             }
         }
@@ -483,7 +614,9 @@ enum MixerTests {
         }
         settings.mixer.kind = .behringerWing
         settings.mixer.address = " 192.168.1.20 "
-        settings.mixer.sectionVisibility = ["dca": false, "in.A": true]
+        for section in settings.mixer.kind.sections where ["dca", "in.A"].contains(section.id) {
+            settings.mixer.setVisible(section, section.id == "in.A")
+        }
         do {
             let data = try PropertyListEncoder().encode(settings)
             let decoded = try PropertyListDecoder().decode(PersistedSettings.self, from: data)
@@ -537,6 +670,103 @@ enum MixerTests {
             || !AnalysisDisplayMode.transferFunction.usesAudioAnalysis
             || !AnalysisDisplayMode.combined.usesAudioAnalysis {
             failures.append("Meter bridge must not run the audio analysis")
+        }
+    }
+
+    private static func testSectionVisibilityByKind(_ failures: inout [String]) {
+        var settings = MixerSettings()
+        settings.kind = .behringerWing
+        guard let wingChannels = MixerKind.behringerWing.sections.first(where: { $0.id == "ch" }),
+              let x32Channels = MixerKind.behringerX32.sections.first(where: { $0.id == "ch" }) else {
+            failures.append("WING or X32 channel section is missing")
+            return
+        }
+        settings.setVisible(wingChannels, false)
+        settings.kind = .behringerX32
+        if !settings.isVisible(x32Channels) || !settings.visibleSections.contains(where: { $0.id == "ch" }) {
+            failures.append("Hiding WING channels also hid X32 channels")
+        }
+        settings.kind = .behringerWing
+        if settings.isVisible(wingChannels) {
+            failures.append("WING section choice was lost after switching the console type")
+        }
+
+        do {
+            let data = try PropertyListEncoder().encode(settings)
+            let decoded = try PropertyListDecoder().decode(MixerSettings.self, from: data)
+            if decoded != settings || decoded.isVisible(wingChannels) {
+                failures.append("Section choices by console type did not survive encoding")
+            }
+            guard let stored = try PropertyListSerialization.propertyList(
+                from: data,
+                format: nil
+            ) as? [String: Any] else {
+                failures.append("Mixer section test could not inspect the property list")
+                return
+            }
+            if stored["sectionVisibility"] as? [String: Bool] != ["ch": false] {
+                failures.append("Section choices of the current console were not kept for older versions")
+            }
+            let byKind = stored["sectionVisibilityByKind"] as? [String: [String: Bool]]
+            if byKind?[MixerKind.behringerWing.rawValue] != ["ch": false] {
+                failures.append("Section choices were not stored by console type")
+            }
+
+            let older: [String: Any] = [
+                "kind": MixerKind.behringerX32.rawValue,
+                "address": "",
+                "sectionVisibility": ["ch": false, "auxout": true]
+            ]
+            let olderData = try PropertyListSerialization.data(
+                fromPropertyList: older,
+                format: .binary,
+                options: 0
+            )
+            var migrated = try PropertyListDecoder().decode(MixerSettings.self, from: olderData)
+            let visible = migrated.visibleSections.map(\.id)
+            if visible.contains("ch") || !visible.contains("auxout") {
+                failures.append("Section choices of an older version were not kept")
+            }
+            migrated.kind = .behringerWing
+            if !migrated.isVisible(wingChannels) {
+                failures.append("Section choices of an older version applied to another console type")
+            }
+        } catch {
+            failures.append("Mixer section choices failed to encode or decode: \(error)")
+        }
+    }
+
+    private static func testUnknownDisplayMode(_ failures: inout [String]) {
+        var settings = PersistedSettings()
+        settings.spectrogram.displayMode = .combined
+        settings.spectrogram.palette = .rgb
+        settings.spectrogram.frequencyRange = .voice
+        do {
+            let data = try PropertyListEncoder().encode(settings)
+            guard var root = try PropertyListSerialization.propertyList(
+                from: data,
+                format: nil
+            ) as? [String: Any], var spectrogram = root["spectrogram"] as? [String: Any] else {
+                failures.append("Display mode test could not inspect the property list")
+                return
+            }
+            spectrogram["displayMode"] = "fromNewerVersion"
+            spectrogram["isEnabled"] = true
+            spectrogram["isTransferFunctionEnabled"] = false
+            root["spectrogram"] = spectrogram
+            let changed = try PropertyListSerialization.data(
+                fromPropertyList: root,
+                format: .binary,
+                options: 0
+            )
+            let decoded = try PropertyListDecoder().decode(PersistedSettings.self, from: changed)
+            if decoded.spectrogram.displayMode != .spectrogram
+                || decoded.spectrogram.palette != .rgb
+                || decoded.spectrogram.frequencyRange != .voice {
+                failures.append("An unknown display mode reset the analysis settings")
+            }
+        } catch {
+            failures.append("Display mode test failed to encode or decode: \(error)")
         }
     }
 
@@ -637,6 +867,59 @@ enum MixerTests {
         controller.configure(settings, now: now)
         if controller.phase != .disabled || drivers.last?.stopCount != 1 {
             failures.append("Removing the mixer did not end the connection")
+        }
+    }
+
+    private static func testConnectionWithoutAttempt(_ failures: inout [String]) {
+        var drivers: [FakeDriver] = []
+        let timing = MixerConnectionController.Timing()
+        let controller = MixerConnectionController(timing: timing) { kind in
+            guard kind != .none else { return nil }
+            let driver = FakeDriver()
+            drivers.append(driver)
+            return driver
+        }
+
+        var settings = MixerSettings()
+        settings.kind = .behringerX32
+        settings.address = "fe80::1"
+        controller.configure(settings, now: 0)
+        controller.tick(now: timing.attemptTimeout + timing.retryDelay)
+        controller.tick(now: 2 * (timing.attemptTimeout + timing.retryDelay))
+        if controller.phase != .invalidAddress || controller.phase.isActive || !drivers.isEmpty {
+            failures.append("An invalid X32 address started or retried a connection")
+        }
+        controller.configure(settings, now: 60)
+        if controller.phase != .invalidAddress || !drivers.isEmpty {
+            failures.append("Unchanged invalid X32 address left its state")
+        }
+
+        settings.address = "x32.local:10023"
+        controller.configure(settings, now: 60)
+        if controller.phase != .connecting || drivers.count != 1
+            || drivers.last?.startedAddress != .some("x32.local:10023") {
+            failures.append("A corrected X32 address did not connect")
+        }
+
+        for section in settings.kind.sections {
+            settings.setVisible(section, false)
+        }
+        controller.configure(settings, now: 61)
+        controller.tick(now: 200)
+        if controller.phase != .noSectionsSelected || controller.phase.isActive
+            || drivers.count != 1 || drivers.last?.stopCount != 1 {
+            failures.append("A mixer without sections kept a connection")
+        }
+
+        settings.address = "a b"
+        controller.configure(settings, now: 201)
+        if controller.phase != .noSectionsSelected || drivers.count != 1 {
+            failures.append("A mixer without sections must not report its address")
+        }
+
+        let active: [MixerConnectionController.Phase] = [.connecting, .waitingToRetry]
+        if !active.allSatisfy(\.isActive) || MixerConnectionController.Phase.disabled.isActive {
+            failures.append("Mixer phases needing regular ticks are wrong")
         }
     }
 }
