@@ -226,7 +226,9 @@ struct SpectrogramSettings: Codable, Equatable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        if let displayMode = try container.decodeIfPresent(
+        // An unknown mode (for example from a newer version) falls back to the
+        // flags every version writes, instead of resetting every analysis setting.
+        if let displayMode = try? container.decodeIfPresent(
             AnalysisDisplayMode.self,
             forKey: .displayMode
         ) {

@@ -216,6 +216,8 @@
 "Mixpult není nastaven." = "Nie skonfigurowano konsolety.";
 "Hledám mixpult…" = "Wyszukiwanie konsolety…";
 "Mixpult není dostupný. Připojení se opakuje automaticky." = "Konsoleta jest niedostępna. Połączenie jest ponawiane automatycznie.";
+"Není vybrána žádná sekce meter bridge." = "Nie wybrano żadnej sekcji meter bridge.";
+"Adresa mixpultu není platná. Zadejte IPv4 adresu nebo název v síti, případně s portem (např. 192.168.1.20:10023)." = "Adres konsolety jest nieprawidłowy. Wpisz adres IPv4 lub nazwę w sieci, opcjonalnie z portem (np. 192.168.1.20:10023).";
 "Připojeno: %@" = "Połączono: %@";
 "Kanály" = "Kanały";
 "Aux" = "Aux";

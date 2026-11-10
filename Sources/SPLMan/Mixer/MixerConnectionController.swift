@@ -6,6 +6,10 @@ import Foundation
 final class MixerConnectionController {
     enum Phase: Equatable {
         case disabled
+        /// A console is configured, but every meter bridge section is hidden.
+        case noSectionsSelected
+        /// The address cannot be used; nothing is retried until it changes.
+        case invalidAddress
         case connecting
         case connected(MixerIdentity)
         case waitingToRetry
@@ -13,6 +17,14 @@ final class MixerConnectionController {
         var isConnected: Bool {
             if case .connected = self { return true }
             return false
+        }
+
+        /// Whether the controller needs regular ticks.
+        var isActive: Bool {
+            switch self {
+            case .connecting, .connected, .waitingToRetry: true
+            case .disabled, .noSectionsSelected, .invalidAddress: false
+            }
         }
     }
 
@@ -61,8 +73,12 @@ final class MixerConnectionController {
         }
         endAttempt()
         rebuildSections()
-        if descriptors.isEmpty {
+        if newSettings.kind == .none {
             phase = .disabled
+        } else if descriptors.isEmpty {
+            phase = .noSectionsSelected
+        } else if !newSettings.kind.isValidAddress(newSettings.connectionAddress) {
+            phase = .invalidAddress
         } else {
             beginAttempt(now: now)
         }
@@ -70,7 +86,7 @@ final class MixerConnectionController {
 
     func tick(now: TimeInterval) {
         switch phase {
-        case .disabled:
+        case .disabled, .noSectionsSelected, .invalidAddress:
             return
         case .waitingToRetry:
             if now >= retryAt { beginAttempt(now: now) }

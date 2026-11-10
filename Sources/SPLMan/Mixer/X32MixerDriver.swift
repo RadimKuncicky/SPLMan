@@ -147,10 +147,35 @@ final class X32MixerDriver: MixerDriver {
         ]
     }()
 
+    /// Levels of a page this old are not shown, so a page that stopped arriving
+    /// does not look live while other pages keep the connection alive.
+    private let staleLevelsAfter: TimeInterval
     private var client: X32Client?
     private var active: [X32MeterDefinition] = []
     private var nameTargets: [String: (section: String, strip: Int)] = [:]
     private var namesRevision = 0
+
+    init(staleLevelsAfter: TimeInterval = MixerConnectionController.Timing().staleLevelsAfter) {
+        self.staleLevelsAfter = staleLevelsAfter
+    }
+
+    /// Levels in dB of every section whose meter page is fresh.
+    static func levels(
+        for definitions: [X32MeterDefinition],
+        pages: [Int: [Float]],
+        ages: [Int: TimeInterval],
+        staleAfter: TimeInterval
+    ) -> [String: [Float]] {
+        var levels: [String: [Float]] = [:]
+        for definition in definitions {
+            guard let age = ages[definition.page],
+                  age < staleAfter,
+                  let page = pages[definition.page],
+                  let sectionLevels = definition.levels(from: page) else { continue }
+            levels[definition.descriptor.id] = sectionLevels
+        }
+        return levels
+    }
 
     func start(address: String?, sections: [MixerMeterSectionDescriptor]) {
         stop()
@@ -190,14 +215,14 @@ final class X32MixerDriver: MixerDriver {
                 model: snapshot.model,
                 firmware: snapshot.firmware
             )),
-            secondsSinceMeterData: snapshot.secondsSinceMeterData
+            secondsSinceMeterData: snapshot.secondsSinceMeterData,
+            levels: Self.levels(
+                for: active,
+                pages: snapshot.meterPages,
+                ages: snapshot.secondsSinceMeterPage,
+                staleAfter: staleLevelsAfter
+            )
         )
-        for definition in active {
-            if let page = snapshot.meterPages[definition.page],
-               let levels = definition.levels(from: page) {
-                update.levels[definition.descriptor.id] = levels
-            }
-        }
 
         if snapshot.namesRevision != namesRevision {
             namesRevision = snapshot.namesRevision
