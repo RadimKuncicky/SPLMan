@@ -22,8 +22,64 @@ struct WirelessSettings: Codable, Equatable {
         var unique = Set<String>()
         return addresses
             .split { $0 == "," || $0 == ";" || $0.isWhitespace }
-            .map(String.init)
+            .compactMap { Self.normalizedAddress(String($0)) }
             .filter { unique.insert($0).inserted }
+    }
+
+    /// One spelling per receiver, so the same one is not connected twice and
+    /// matches the addresses discovery reports. Nil for empty text.
+    static func normalizedAddress(_ text: String) -> String? {
+        var address = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if address.hasPrefix("["), let end = address.firstIndex(of: "]") {
+            // [IPv6] or [IPv6]:port
+            address = String(address[address.index(after: address.startIndex)..<end])
+        } else if let colon = address.firstIndex(of: ":"), address.lastIndex(of: ":") == colon {
+            // The receiver only listens on its command port, so a port typed
+            // with the address is dropped rather than read as part of a name.
+            // More than one colon is an IPv6 address.
+            let port = address[address.index(after: colon)...]
+            if (1...5).contains(port.count), port.allSatisfy({ ("0"..."9").contains($0) }) {
+                address = String(address[..<colon])
+            }
+        }
+        guard !address.isEmpty else { return nil }
+
+        let parts = address.split(separator: ".", omittingEmptySubsequences: false)
+        if parts.count == 4, parts.allSatisfy({ part in
+            (1...3).contains(part.count) && part.allSatisfy { ("0"..."9").contains($0) }
+        }) {
+            // Receiver displays pad addresses with zeros, which are decimal
+            // here; the system would reject them or read them as octal.
+            let values = parts.compactMap { Int($0) }
+            // An impossible address stays as typed, to show up as unavailable.
+            guard values.count == 4, values.allSatisfy({ $0 <= 255 }) else { return address }
+            return values.map { String($0) }.joined(separator: ".")
+        }
+        // Host names are not case sensitive.
+        return address.lowercased()
+    }
+}
+
+/// A receiver found by a network scan stays in use while the scan or a
+/// connection has confirmed it lately, so one that was switched off or got
+/// another address is eventually let go.
+enum WirelessScanExpiry {
+    static let lifetime: TimeInterval = 30
+
+    static func isWanted(
+        foundAt: TimeInterval,
+        lastConnectedAt: TimeInterval?,
+        now: TimeInterval
+    ) -> Bool {
+        now - max(foundAt, lastConnectedAt ?? foundAt) < lifetime
+    }
+
+    /// Leaves out connections too old to keep anything wanted.
+    static func pruned(
+        _ lastConnectedAt: [String: TimeInterval],
+        now: TimeInterval
+    ) -> [String: TimeInterval] {
+        lastConnectedAt.filter { now - $0.value < lifetime }
     }
 }
 

@@ -15,8 +15,6 @@ final class WirelessMonitorModel: ObservableObject {
 
     private static let pollInterval: TimeInterval = 1.0 / 15.0
     private static let ticksPerDiscoveryUpdate = 15
-    /// Receivers advertise about every 2 s, so this tolerates many lost datagrams.
-    private static let advertisementLifetime: TimeInterval = 30
 
     private let queue = DispatchQueue(label: "cz.splman.wireless", qos: .userInitiated)
     private let controller = WirelessMonitorController()
@@ -24,6 +22,9 @@ final class WirelessMonitorModel: ObservableObject {
     private let scanner = ShureNetworkScanner()
     private var timer: DispatchSourceTimer?
     private var ticksSinceDiscoveryUpdate = 0
+    /// By address: when each receiver was last seen connected, which keeps a
+    /// scanned receiver in use long after the scan that found it.
+    private var lastConnectedAt: [String: TimeInterval] = [:]
     private var publishedEnabled = false
     private var publishedReceivers: [WirelessReceiverStatus] = []
     private var publishedChannels: [WirelessChannel] = []
@@ -40,6 +41,7 @@ final class WirelessMonitorModel: ObservableObject {
             } else {
                 self.discovery.stop()
                 self.scanner.stop()
+                self.lastConnectedAt = [:]
                 self.stopTimer()
             }
             self.publishChanges()
@@ -60,6 +62,7 @@ final class WirelessMonitorModel: ObservableObject {
             stopTimer()
             discovery.stop()
             scanner.stop()
+            lastConnectedAt = [:]
             controller.shutdown()
             levels.replace([:])
         }
@@ -95,12 +98,25 @@ final class WirelessMonitorModel: ObservableObject {
     }
 
     private func updateDiscovered() {
-        var addresses = Set(scanner.snapshot().addresses)
+        let now = Self.now
+        for receiver in controller.receivers where receiver.phase == .connected {
+            lastConnectedAt[receiver.address] = now
+        }
+        lastConnectedAt = WirelessScanExpiry.pruned(lastConnectedAt, now: now)
+        var addresses = Set<String>()
+        for found in scanner.snapshot().found {
+            let isWanted = WirelessScanExpiry.isWanted(
+                foundAt: now - found.secondsSinceFound,
+                lastConnectedAt: lastConnectedAt[found.address],
+                now: now
+            )
+            if isWanted { addresses.insert(found.address) }
+        }
         for receiver in discovery.snapshot()
-        where receiver.secondsSinceSeen < Self.advertisementLifetime {
+        where receiver.secondsSinceSeen < ShureDiscovery.advertisementLifetime {
             addresses.insert(receiver.address)
         }
-        controller.setDiscovered(addresses, now: Self.now)
+        controller.setDiscovered(addresses, now: now)
     }
 
     private func publishChanges() {

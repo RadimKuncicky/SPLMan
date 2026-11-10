@@ -212,7 +212,10 @@ public enum ShureProtocol {
             case "AUDIO_LEVEL_RMS":
                 return .audioLevel(channel: channel, dBFS: scaled(value, valid: 0...120, offset: -120))
             case "RSSI":
-                guard tokens.count >= 5, let antenna = Int(value) else { return nil }
+                // The receivers have two antennas; anything else is not a reading.
+                guard tokens.count >= 5, let antenna = Int(value), (1...2).contains(antenna) else {
+                    return nil
+                }
                 return .rfLevel(
                     channel: channel,
                     antenna: antenna,
@@ -234,6 +237,12 @@ public enum ShureProtocol {
         case .ulxd:
             switch property {
             case "AUDIO_LVL":
+                // 0 is the floor of the format, not a level of -50 dBFS: shown
+                // as such, a silent microphone would light the bottom of a meter
+                // whose scale reaches lower. Below the scale reads as silence.
+                if Int(value) == 0 {
+                    return .audioLevel(channel: channel, dBFS: -Double.infinity)
+                }
                 // The format allows 255, but above 0 dBFS the value is not a level.
                 return .audioLevel(channel: channel, dBFS: scaled(value, valid: 0...50, offset: -50))
             case "RX_RF_LVL":

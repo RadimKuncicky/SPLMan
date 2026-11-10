@@ -252,6 +252,10 @@ public final class ShureClient {
         case .audioLevel(let channel, let level):
             update(channel) { $0.audioLevelDBFS = level }
         case .rfLevel(let channel, let antenna, let level):
+            // The numbers come from the network, so only the receiver's own
+            // channels and antennas may become keys here.
+            guard channels.contains(where: { $0.number == channel }),
+                  (0...2).contains(antenna) else { return }
             rfLevels[channel, default: [:]][antenna] = level
             // The stronger antenna is the one that carries the signal.
             let strongest = rfLevels[channel]?.values.max()
