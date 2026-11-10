@@ -24,6 +24,8 @@ enum MixerTests {
         testWingDefinitions(&failures)
         testWingRequests(&failures)
         testWingReplies(&failures)
+        testWingFilter(&failures)
+        testWingMeasurement(&failures)
         testWingStream(&failures)
         testX32Protocol(&failures)
         testX32Definitions(&failures)
@@ -140,8 +142,14 @@ enum MixerTests {
             failures.append("WING discovery reply was not read")
         }
         if WingConsoleInfo(discoveryReply: "OTHER,1,2,3,4,5") != nil
-            || WingConsoleInfo(discoveryReply: "WING,1") != nil {
+            || WingConsoleInfo(discoveryReply: "WING,1") != nil
+            || WingConsoleInfo(discoveryReply: "WING,,Stage,wing,S1,3") != nil {
             failures.append("An invalid WING discovery reply was accepted")
+        }
+        let comma = WingConsoleInfo(discoveryReply: "WING,10.0.0.5,FOH, main,wing-rack,S1,3.1")
+        if comma?.ip != "10.0.0.5" || comma?.name != "FOH, main" || comma?.model != "wing-rack"
+            || comma?.serial != "S1" || comma?.firmware != "3.1" {
+            failures.append("A WING console name with a comma shifted the other fields")
         }
 
         let report = WingMeterReport(packet: [0, 0, 0, 2, 0xff, 0x00, 0x01, 0x00, 0x07])
@@ -150,6 +158,105 @@ enum MixerTests {
         }
         if WingMeterReport(packet: [0, 0, 2]) != nil {
             failures.append("A truncated WING meter report was accepted")
+        }
+    }
+
+    private static func testWingFilter(_ failures: inout [String]) {
+        let filter = WingConsoleFilter(address: "10.0.0.5")
+        if !filter.acceptsMeters(from: "10.0.0.5") || filter.acceptsMeters(from: "10.0.0.6") {
+            failures.append("WING meters were not limited to the console's address")
+        }
+        if filter.acceptsMeters(from: "not an address") || filter.acceptsMeters(from: "") {
+            failures.append("WING meters from an unreadable sender were accepted")
+        }
+        if !WingConsoleFilter(address: " 10.0.0.5 ").acceptsMeters(from: "10.0.0.5") {
+            failures.append("WING console address was not compared as IPv4")
+        }
+        if !WingConsoleFilter(address: nil).acceptsMeters(from: "10.0.0.6")
+            || !WingConsoleFilter(address: "wing.local").acceptsMeters(from: "10.0.0.6") {
+            failures.append("WING meters were dropped while the console's address was unknown")
+        }
+
+        guard let own = WingConsoleInfo(discoveryReply: "WING,10.0.0.5,FOH,wing-rack,S1,3.1"),
+              let other = WingConsoleInfo(discoveryReply: "WING,10.0.0.7,MON,wing,S2,3.1"),
+              let unreadable = WingConsoleInfo(discoveryReply: "WING,console,X,wing,S3,3.1") else {
+            failures.append("WING filter test replies were not read")
+            return
+        }
+        if filter.acceptsConsoleInfo(other, from: "10.0.0.7")
+            || filter.acceptsConsoleInfo(unreadable, from: "console") {
+            failures.append("Another WING console's discovery reply replaced the console")
+        }
+        if !filter.acceptsConsoleInfo(own, from: "10.0.0.7")
+            || !filter.acceptsConsoleInfo(other, from: "10.0.0.5") {
+            failures.append("The WING console's own discovery reply was rejected")
+        }
+        if !WingConsoleFilter(address: nil).acceptsConsoleInfo(other, from: "10.0.0.7") {
+            failures.append("A WING discovery reply was rejected before the address was known")
+        }
+    }
+
+    private static func testWingMeasurement(_ failures: inout [String]) {
+        typealias Measurement = WingGroupMeasurement
+        let ch0 = WingMeter(kind: .channel, index: 0)
+        let ch1 = WingMeter(kind: .channel, index: 1)
+        let aux = WingMeter(kind: .aux, index: 0)
+        let source = WingMeter(kind: .source, index: 0)
+        let output = WingMeter(kind: .output, index: 0)
+        func required(_ meters: [WingMeter]) -> WingMeterGroup {
+            WingMeterGroup(meters: meters, isRequired: true)
+        }
+        func optional(_ meters: [WingMeter]) -> WingMeterGroup {
+            WingMeterGroup(meters: meters, isRequired: false)
+        }
+
+        // Collections grow; reports of the previous one are not longer than the total.
+        var normal = Measurement(groups: [required([ch0, ch1]), optional([source]), required([aux])])
+        if normal.start() != .request([ch0, ch1])
+            || normal.receive(length: 0) != nil
+            || normal.receive(length: 16) != .request([ch0, ch1, source])
+            || normal.receive(length: 16) != nil
+            || normal.receive(length: 18) != .request([ch0, ch1, source, aux])
+            || normal.receive(length: 18) != nil
+            || normal.receive(length: 26) != .finished(lengths: [16, 2, 8]) {
+            failures.append("WING group lengths were not measured cumulatively")
+        }
+
+        var absent = Measurement(groups: [required([ch0]), optional([source]), optional([output])])
+        if absent.start() != .request([ch0])
+            || absent.receive(length: 8) != .request([ch0, source])
+            || absent.receive(length: 8) != nil
+            || absent.timeout() != .request([ch0, output])
+            || absent.receive(length: 9) != .finished(lengths: [8, 0, 1]) {
+            failures.append("An absent optional WING group was not skipped")
+        }
+
+        var retried = Measurement(groups: [required([ch0]), required([aux])])
+        if retried.start() != .request([ch0])
+            || retried.receive(length: 8) != .request([ch0, aux])
+            || retried.receive(length: 8) != nil
+            || retried.timeout() != .request([ch0, aux])
+            || retried.receive(length: 16) != .finished(lengths: [8, 8]) {
+            failures.append("A late required WING group was not requested again")
+        }
+
+        var silent = Measurement(groups: [required([ch0])])
+        let silentSteps = [silent.start(), silent.timeout(), silent.timeout()]
+        let repeated = [Measurement.Step](repeating: .request([ch0]), count: Measurement.maximumAttempts)
+        if silentSteps != repeated {
+            failures.append("A silent required WING group was not requested again")
+        }
+        if case .failed = silent.timeout() {} else {
+            failures.append("A silent required WING group did not end the session")
+        }
+
+        var missing = Measurement(groups: [optional([source]), required([ch0])])
+        if missing.start() != .request([source])
+            || missing.timeout() != .request([source])
+            || missing.timeout() != .request([source])
+            || missing.timeout() != .request([ch0])
+            || missing.receive(length: 8) != .finished(lengths: [0, 8]) {
+            failures.append("A silent optional WING group was not given up")
         }
     }
 
@@ -187,8 +294,20 @@ enum MixerTests {
         if texts([0xd1, 0x01, 0x4f, 0x4b]) != ["OK"] {
             failures.append("WING long text value was not decoded")
         }
-        if texts([0xd5, 0x00, 0x00, 0x00, 0x00, 0x01, 0x40, 0xde, 0x80, 0x5a]) != ["Z"] {
+        if texts([0xd5, 0x00, 0x00, 0x00, 0x00, 0x01, 0xd3, 0x80, 0x41, 0xde, 0x80, 0x5a]) != ["Z"] {
             failures.append("WING values without text were not skipped")
+        }
+
+        // Navigation without a hash leads to a node the parser cannot name.
+        let hash: [UInt8] = [0xd7, 0x02, 0xdf, 0xde, 0xaf, 0x0e]
+        let navigations: [[UInt8]] = [[0x40], [0x7f], [0xd2, 0x80, 0x43], [0xda], [0xdb]]
+        for navigation in navigations {
+            if !texts(navigation + [0x80, 0x41]).isEmpty {
+                failures.append("WING text after navigation \(navigation) was given the last hashed node")
+            }
+            if texts(hash + [0x80, 0x42]) != ["B"] {
+                failures.append("WING text after a new node hash was not reported")
+            }
         }
     }
 

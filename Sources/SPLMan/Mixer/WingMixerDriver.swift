@@ -89,7 +89,13 @@ final class WingMixerDriver: MixerDriver {
         }
         let client = WingClient(
             address: address,
-            meterGroups: active.map(\.meters),
+            meterGroups: active.map { definition in
+                // Strips exist on every model; connectors depend on its cards.
+                WingMeterGroup(
+                    meters: definition.meters,
+                    isRequired: definition.descriptor.stripCount != nil
+                )
+            },
             nameNodes: active.flatMap(\.nameIDs)
         )
         self.client = client

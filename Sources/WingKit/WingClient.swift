@@ -34,20 +34,24 @@ public final class WingClient {
     private static let renewalsPerNameRefresh = 10
     private static let connectionTimeoutSeconds = 5
     private static let log = Logger(subsystem: "cz.splman.wingkit", category: "session")
-    /// A group the console does not have may never report.
+    /// A group the console does not have may never report. Also how long after
+    /// measuring reports of the last measured collection may still arrive.
     private static let measurementTimeout: TimeInterval = 0.5
-    /// A real console kept sending only one of several simultaneous reports, so
-    /// all groups share one, like the single request of the wapi library.
+    /// A real console kept sending only one of several simultaneous reports, and
+    /// there is no way to cancel one, so measuring and streaming use a single
+    /// report, like the single request of the wapi library.
     private static let combinedReportID: UInt32 = 1
 
     private let queue = DispatchQueue(label: "cz.splman.wingkit", qos: .userInitiated)
-    private let meterGroups: [[WingMeter]]
+    private let meterGroups: [WingMeterGroup]
     private let nameNodes: [Int32]
     private let nameNodeSet: Set<Int32>
 
     private var state = State.connecting
     private var address: String?
     private var console: WingConsoleInfo?
+    private var filter = WingConsoleFilter(address: nil)
+    private var measurement: WingGroupMeasurement
     private var lastMeterDataAt: TimeInterval?
     private var reports: [[Int16]]
     private var names: [Int32: String] = [:]
@@ -71,12 +75,13 @@ public final class WingClient {
     ///   - address: The console's address, or nil to find it by broadcast.
     ///   - meterGroups: The values of each group are kept apart in `Snapshot.reports`.
     ///   - nameNodes: Text parameters to read and keep current.
-    public init(address: String?, meterGroups: [[WingMeter]], nameNodes: [Int32]) {
+    public init(address: String?, meterGroups: [WingMeterGroup], nameNodes: [Int32]) {
         self.address = address
         self.meterGroups = meterGroups
         self.nameNodes = nameNodes
         nameNodeSet = Set(nameNodes)
         reports = Array(repeating: [], count: meterGroups.count)
+        measurement = WingGroupMeasurement(groups: meterGroups)
     }
 
     deinit { tearDown() }
@@ -114,13 +119,14 @@ public final class WingClient {
 
     private func begin() {
         guard state == .connecting, connection == nil, socket == nil else { return }
-        socket = ConsoleUDPSocket(queue: queue) { [weak self] datagram, _ in
-            self?.handleDatagram(datagram)
+        socket = ConsoleUDPSocket(queue: queue) { [weak self] datagram, sender in
+            self?.handleDatagram(datagram, from: sender)
         }
         guard let socket else {
             fail("no UDP socket")
             return
         }
+        filter = WingConsoleFilter(address: address)
         if let address {
             // The reply only names the console; the connection does not wait for it.
             if let destination = ConsoleUDPSocket.ipv4Address(address) {
@@ -194,37 +200,48 @@ public final class WingClient {
         socket?.broadcast(WingProtocol.discoveryRequest, port: WingProtocol.port)
     }
 
-    private func handleDatagram(_ datagram: [UInt8]) {
+    private func handleDatagram(_ datagram: [UInt8], from sender: in_addr) {
+        let senderText = ConsoleUDPSocket.text(of: sender)
         if datagram.starts(with: WingProtocol.discoveryReplyPrefix) {
             guard let info = WingConsoleInfo(
                 discoveryReply: String(decoding: datagram, as: UTF8.self)
             ) else { return }
-            console = info
             if connection == nil, address == nil {
+                console = info
                 address = info.ip
+                filter = WingConsoleFilter(address: info.ip)
                 discoveryTimer?.cancel()
                 discoveryTimer = nil
                 openConnection(to: info.ip)
+            } else if filter.acceptsConsoleInfo(info, from: senderText) {
+                console = info
             }
             return
         }
-        guard let report = WingMeterReport(packet: datagram) else {
+        guard filter.acceptsMeters(from: senderText),
+              let report = WingMeterReport(packet: datagram) else {
             ignoredDatagrams += 1
             return
         }
         if state == .connected, report.reportID == Self.combinedReportID {
             applyCombined(report)
-        } else if measurementTimer != nil, report.reportID == measurementReportID {
-            groupLengths.append(report.words.count)
-            measureNextGroup()
+        } else if measurementTimer != nil, report.reportID == Self.combinedReportID {
+            if let step = measurement.receive(length: report.words.count) {
+                perform(step)
+            }
         } else {
-            // Includes what a console still sends for an earlier measurement.
             ignoredDatagrams += 1
         }
     }
 
     private func applyCombined(_ report: WingMeterReport) {
         guard let groups = WingProtocol.split(report.words, lengths: groupLengths) else {
+            if let connectedAt,
+               ProcessInfo.processInfo.systemUptime - connectedAt < Self.measurementTimeout {
+                // The console may still send the last measured collection.
+                ignoredDatagrams += 1
+                return
+            }
             // For example a card was exchanged. Reconnecting measures again, and
             // values must not be shown on the wrong strips until then.
             fail("report of \(report.words.count) values does not match the groups")
@@ -260,6 +277,7 @@ public final class WingClient {
     private func handle(_ connectionState: NWConnection.State) {
         switch connectionState {
         case .ready:
+            filter = WingConsoleFilter(address: remoteIPv4Address() ?? address)
             subscribe()
         case .failed(let error):
             fail("connection failed: \(error)")
@@ -282,38 +300,41 @@ public final class WingClient {
             WingProtocol.selectControlChannel + WingProtocol.meterPort(meterPort) + nameRequests()
         )
         receiveStream()
-        measureNextGroup()
+        perform(measurement.start())
     }
 
-    /// A combined report does not say where each group starts, and the number of
-    /// connectors depends on the model and its cards. So each group is requested
-    /// alone once, and its first report tells its length.
-    private func measureNextGroup() {
+    /// The address the connection reached, which a host name does not tell.
+    private func remoteIPv4Address() -> String? {
+        guard case .hostPort(host: .ipv4(let ip), port: _)? = connection?.currentPath?.remoteEndpoint
+        else { return nil }
+        return ip.rawValue.map { String($0) }.joined(separator: ".")
+    }
+
+    /// Carries out a step of measuring how many values each group reports; see
+    /// `WingGroupMeasurement`. A report's collection is replaced by each request,
+    /// so measuring needs no report of its own.
+    private func perform(_ step: WingGroupMeasurement.Step) {
         measurementTimer?.cancel()
         measurementTimer = nil
-        let group = groupLengths.count
-        guard group < meterGroups.count else {
+        groupLengths = measurement.lengths
+        switch step {
+        case .request(let meters):
+            transmit(WingProtocol.meterRequest(reportID: Self.combinedReportID, meters: meters))
+            measurementTimer = makeTimer(interval: Self.measurementTimeout) { [weak self] in
+                guard let self else { return }
+                self.perform(self.measurement.timeout())
+            }
+        case .finished(let lengths):
+            groupLengths = lengths
             startStreaming()
-            return
+        case .failed(let reason):
+            fail(reason)
         }
-        transmit(WingProtocol.meterRequest(
-            reportID: measurementReportID,
-            meters: meterGroups[group]
-        ))
-        measurementTimer = makeTimer(interval: Self.measurementTimeout) { [weak self] in
-            self?.groupLengths.append(0)
-            self?.measureNextGroup()
-        }
-    }
-
-    /// Differs from the combined report, which must not be mistaken for a group.
-    private var measurementReportID: UInt32 {
-        Self.combinedReportID + 1 + UInt32(groupLengths.count)
     }
 
     private func startStreaming() {
         let meters: [WingMeter] = zip(meterGroups, groupLengths).flatMap { group, length in
-            length > 0 ? group : []
+            length > 0 ? group.meters : []
         }
         transmit(WingProtocol.meterRequest(reportID: Self.combinedReportID, meters: meters))
         renewalTimer = makeTimer(interval: Self.renewalInterval) { [weak self] in

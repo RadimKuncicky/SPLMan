@@ -1,3 +1,4 @@
+import ConsoleSockets
 import Foundation
 
 /// A meter block of the console. `index` is zero-based and at most 127.
@@ -22,6 +23,19 @@ public struct WingMeter: Equatable {
     }
 }
 
+/// Meters whose values are kept apart in the session's reports.
+public struct WingMeterGroup: Equatable {
+    public let meters: [WingMeter]
+    /// Every console has the group, so one that does not report is an error
+    /// rather than a missing card.
+    public let isRequired: Bool
+
+    public init(meters: [WingMeter], isRequired: Bool) {
+        self.meters = meters
+        self.isRequired = isRequired
+    }
+}
+
 /// Reply to the `WING?` discovery datagram: `WING,ip,name,model,serial,firmware`.
 public struct WingConsoleInfo: Equatable {
     public let ip: String
@@ -35,11 +49,127 @@ public struct WingConsoleInfo: Equatable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .components(separatedBy: ",")
         guard fields.count >= 6, fields[0] == "WING", !fields[1].isEmpty else { return nil }
+        // The name may contain commas; the fields after it do not.
+        let count = fields.count
         ip = fields[1]
-        name = fields[2]
-        model = fields[3]
-        serial = fields[4]
-        firmware = fields[5]
+        name = fields[2..<(count - 3)].joined(separator: ",")
+        model = fields[count - 3]
+        serial = fields[count - 2]
+        firmware = fields[count - 1]
+    }
+}
+
+/// Decides which datagrams belong to the session's console. Addresses are
+/// compared as IPv4, so text that is not an IPv4 address never matches. While
+/// the console's address is unknown, everything is accepted.
+public struct WingConsoleFilter {
+    private let consoleAddress: UInt32?
+
+    /// - Parameter address: The console's address; a host name or nil leaves it unknown.
+    public init(address: String?) {
+        consoleAddress = address.flatMap(Self.ipv4)
+    }
+
+    public func acceptsMeters(from sender: String) -> Bool {
+        guard let consoleAddress else { return true }
+        return Self.ipv4(sender) == consoleAddress
+    }
+
+    /// Another console on the network answers discovery too. A console may name
+    /// the address of another interface, so either its sender or the address it
+    /// names must be the console's.
+    public func acceptsConsoleInfo(_ info: WingConsoleInfo, from sender: String) -> Bool {
+        guard let consoleAddress else { return true }
+        return Self.ipv4(info.ip) == consoleAddress || Self.ipv4(sender) == consoleAddress
+    }
+
+    private static func ipv4(_ text: String) -> UInt32? {
+        ConsoleUDPSocket.ipv4Address(text.trimmingCharacters(in: .whitespacesAndNewlines))?.s_addr
+    }
+}
+
+/// Finds the number of values each group contributes to one combined report,
+/// which does not say where a group starts. The number of connectors depends on
+/// the model and its cards.
+///
+/// A request replaces the collection of its report, so all requests share one
+/// report and the console only ever sends one. Each step requests the groups
+/// measured so far plus the next one; a report longer than the measured total
+/// tells the new group's length. Reports of the previous collection are never
+/// longer than that total, so they cannot be mistaken for it.
+public struct WingGroupMeasurement {
+    public enum Step: Equatable {
+        /// Send this collection and call `timeout()` if no step follows in time.
+        case request([WingMeter])
+        case finished(lengths: [Int])
+        case failed(String)
+    }
+
+    public static let maximumAttempts = 3
+
+    private let groups: [WingMeterGroup]
+    /// Values per group, in group order, as far as they are known.
+    public private(set) var lengths: [Int] = []
+    private var attempts = 0
+    /// Length of the latest report received for the current group.
+    private var latestLength: Int?
+
+    public init(groups: [WingMeterGroup]) {
+        self.groups = groups
+    }
+
+    public mutating func start() -> Step {
+        lengths = []
+        return nextGroup()
+    }
+
+    /// Returns nil while the report does not contain the current group yet.
+    public mutating func receive(length: Int) -> Step? {
+        guard lengths.count < groups.count else { return nil }
+        let base = measuredTotal
+        guard length > base else {
+            latestLength = length
+            return nil
+        }
+        lengths.append(length - base)
+        return nextGroup()
+    }
+
+    public mutating func timeout() -> Step {
+        guard lengths.count < groups.count else { return .finished(lengths: lengths) }
+        let group = groups[lengths.count]
+        // The console answers, but without the group: it has no such card.
+        if latestLength == measuredTotal, !group.isRequired {
+            lengths.append(0)
+            return nextGroup()
+        }
+        guard attempts >= Self.maximumAttempts else { return request() }
+        if group.isRequired {
+            return .failed("group \(lengths.count + 1) reported no values")
+        }
+        lengths.append(0)
+        return nextGroup()
+    }
+
+    private var measuredTotal: Int { lengths.reduce(0, +) }
+
+    private mutating func nextGroup() -> Step {
+        while lengths.count < groups.count, groups[lengths.count].meters.isEmpty {
+            lengths.append(0)
+        }
+        guard lengths.count < groups.count else { return .finished(lengths: lengths) }
+        attempts = 0
+        latestLength = nil
+        return request()
+    }
+
+    private mutating func request() -> Step {
+        attempts += 1
+        // Groups without values would only repeat the question of their absence.
+        let measured: [WingMeter] = zip(groups, lengths).flatMap { group, length in
+            length > 0 ? group.meters : []
+        }
+        return .request(measured + groups[lengths.count].meters)
     }
 }
 
@@ -259,11 +389,18 @@ public struct WingStreamParser {
             state = .text(remaining: Int(token - 0x80) + 1)
         case 0xc0...0xcf:
             state = .skipping(Int(token - 0xc0) + 1)
+        case 0x40...0x7f, 0xda, 0xdb:
+            // Navigation by index or through the tree leaves the hashed node, so
+            // a following value belongs to a node this parser does not know.
+            currentNode = nil
         case 0xd0:
             emit("", &results)
         case 0xd1:
             state = .textLength
-        case 0xd2, 0xd3:
+        case 0xd2:
+            currentNode = nil
+            state = .skipping(2)
+        case 0xd3:
             state = .skipping(2)
         case 0xd4, 0xd5, 0xd6:
             state = .skipping(4)
@@ -276,7 +413,7 @@ public struct WingStreamParser {
             accumulator = 0
             state = .definitionLength(remaining: 2)
         default:
-            // Integers, node indexes and tree navigation carry no further bytes.
+            // Integers and other tokens without further bytes.
             break
         }
     }
