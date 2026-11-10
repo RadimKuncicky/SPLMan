@@ -22,6 +22,8 @@ enum WirelessTests {
         testULXDReports(&failures)
         testAdvertisement(&failures)
         testScanRange(&failures)
+        testScanExpiry(&failures)
+        testAdvertisementSenders(&failures)
         testSettings(&failures)
         testConnection(&failures)
         testDiscoveredReceivers(&failures)
@@ -164,12 +166,20 @@ enum WirelessTests {
         for (text, expected) in plusCases where report(text, .slxdPlus) != expected {
             failures.append("SLX-D+ report was read incorrectly: \(text)")
         }
+        // The receivers have antennas 1 and 2 only.
+        for text in ["< REP 1 RSSI 3 080 >", "< REP 1 RSSI 0 080 >"]
+        where report(text, .slxd) != nil || report(text, .slxdPlus) != nil {
+            failures.append("SLX-D signal of an antenna that does not exist was accepted: \(text)")
+        }
     }
 
     private static func testULXDReports(_ failures: inout [String]) {
         let cases: [(String, ShureReport)] = [
             ("< REP 3 AUDIO_LVL 032 >", .audioLevel(channel: 3, dBFS: -18)),
             ("< REP 3 AUDIO_LVL 255 >", .audioLevel(channel: 3, dBFS: nil)),
+            // The floor of the format is silence, not a level the meter shows.
+            ("< REP 3 AUDIO_LVL 000 >", .audioLevel(channel: 3, dBFS: -Double.infinity)),
+            ("< REP 3 AUDIO_LVL 001 >", .audioLevel(channel: 3, dBFS: -49)),
             ("< REP 1 RX_RF_LVL 078 >", .rfLevel(channel: 1, antenna: 0, dBm: -50)),
             ("< REP 1 RX_RF_LVL 255 >", .rfLevel(channel: 1, antenna: 0, dBm: nil)),
             ("< REP 1 BATT_BARS 002 >", .batteryBars(channel: 1, bars: 2)),
@@ -226,12 +236,49 @@ enum WirelessTests {
         }
     }
 
+    private static func testScanExpiry(_ failures: inout [String]) {
+        typealias Expiry = WirelessScanExpiry
+        let now: TimeInterval = 1_000
+        if !Expiry.isWanted(foundAt: now, lastConnectedAt: nil, now: now) {
+            failures.append("A receiver the scan just found was not used")
+        }
+        if Expiry.isWanted(foundAt: now - 31, lastConnectedAt: nil, now: now) {
+            failures.append("A scanned receiver that never connected did not expire")
+        }
+        if !Expiry.isWanted(foundAt: now - 600, lastConnectedAt: now - 5, now: now) {
+            failures.append("A scanned receiver that is connected expired")
+        }
+        if Expiry.isWanted(foundAt: now - 600, lastConnectedAt: now - 31, now: now) {
+            failures.append("A scanned receiver that lost its connection long ago did not expire")
+        }
+        if Expiry.pruned(["10.0.0.1": now - 5, "10.0.0.2": now - 31], now: now) != ["10.0.0.1": now - 5] {
+            failures.append("Old connection times were kept")
+        }
+    }
+
+    private static func testAdvertisementSenders(_ failures: inout [String]) {
+        let networks = [(address: "192.168.1.20", netmask: "255.255.255.0")]
+        if !ShureDiscovery.isOnLocalNetwork("192.168.1.50", networks: networks) {
+            failures.append("An advertisement from the local network was refused")
+        }
+        if ShureDiscovery.isOnLocalNetwork("10.0.0.5", networks: networks)
+            || ShureDiscovery.isOnLocalNetwork("invalid", networks: networks)
+            || ShureDiscovery.isOnLocalNetwork("192.168.1.50", networks: []) {
+            failures.append("An advertisement from outside the local networks was accepted")
+        }
+    }
+
     private static func testSettings(_ failures: inout [String]) {
         var settings = WirelessSettings()
         settings.addresses = " 192.168.1.2, 192.168.1.3;192.168.1.2\nrx.local "
         if settings.manualAddresses != ["192.168.1.2", "192.168.1.3", "rx.local"] {
             failures.append("Wireless addresses were not split and deduplicated")
         }
+        settings.addresses = "192.168.001.050, 192.168.1.50:2202; RX.local [fe80::1]:2202 fe80::2 10.0.0.300"
+        if settings.manualAddresses != ["192.168.1.50", "rx.local", "fe80::1", "fe80::2", "10.0.0.300"] {
+            failures.append("Wireless addresses were not normalized before deduplication")
+        }
+        settings.addresses = " 192.168.1.2, 192.168.1.3;192.168.1.2\nrx.local "
         if !WirelessSettings().manualAddresses.isEmpty || WirelessSettings().isEnabled {
             failures.append("Wireless monitoring must be off without addresses by default")
         }

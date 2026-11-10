@@ -13,13 +13,25 @@ public final class ShureDiscovery {
         public let secondsSinceSeen: TimeInterval
     }
 
+    /// Receivers advertise about every 2 s, so this tolerates many lost datagrams.
+    public static let advertisementLifetime: TimeInterval = 30
+
     /// A network that comes up later, or a port that was busy, is picked up here.
     private static let maintenanceInterval: TimeInterval = 15
+    /// Far more than any rig. Anyone on the network can send these datagrams,
+    /// so without a limit forged senders could grow the list, and the
+    /// connections made to it, without end.
+    private static let maximumReceivers = 64
+
+    /// In host byte order.
+    private typealias IPv4Network = (address: UInt32, netmask: UInt32)
 
     private let queue = DispatchQueue(label: "cz.splman.shurekit.discovery", qos: .utility)
     private var listener: MulticastUDPListener?
     private var maintenanceTimer: DispatchSourceTimer?
     private var seen: [String: (advertisement: ShureAdvertisement, at: TimeInterval)] = [:]
+    /// Read here rather than per datagram, which anyone can send at any rate.
+    private var localNetworks: [IPv4Network] = []
 
     public init() {}
 
@@ -70,7 +82,37 @@ public final class ShureDiscovery {
         listener = nil
     }
 
+    /// Whether `sender` is on the same network as one of `networks`, all in
+    /// dotted decimal. Text that is no IPv4 address is on no network.
+    public static func isOnLocalNetwork(
+        _ sender: String,
+        networks: [(address: String, netmask: String)]
+    ) -> Bool {
+        guard let sender = ConsoleUDPSocket.ipv4Address(sender) else { return false }
+        let parsed = networks.compactMap { network -> IPv4Network? in
+            guard let address = ConsoleUDPSocket.ipv4Address(network.address),
+                  let netmask = ConsoleUDPSocket.ipv4Address(network.netmask) else { return nil }
+            return (
+                address: UInt32(bigEndian: address.s_addr),
+                netmask: UInt32(bigEndian: netmask.s_addr)
+            )
+        }
+        return contains(UInt32(bigEndian: sender.s_addr), in: parsed)
+    }
+
+    private static func contains(_ host: UInt32, in networks: [IPv4Network]) -> Bool {
+        networks.contains { (host & $0.netmask) == ($0.address & $0.netmask) }
+    }
+
     private func maintain() {
+        localNetworks = ConsoleNetwork.ipv4Interfaces().map { interface -> IPv4Network in
+            (
+                address: UInt32(bigEndian: interface.address.s_addr),
+                netmask: UInt32(bigEndian: interface.netmask.s_addr)
+            )
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        seen = seen.filter { now - $0.value.at < Self.advertisementLifetime }
         if let listener {
             listener.joinGroup()
             return
@@ -85,11 +127,17 @@ public final class ShureDiscovery {
     }
 
     private func handle(_ datagram: [UInt8], from sender: in_addr) {
-        guard let advertisement = ShureAdvertisement(datagram: datagram),
+        // The app connects to whoever is listed, so a datagram routed in from
+        // elsewhere must not add anyone: receivers share a network with this Mac.
+        guard Self.contains(UInt32(bigEndian: sender.s_addr), in: localNetworks),
+              let advertisement = ShureAdvertisement(datagram: datagram),
               ShureReceiverModel(name: advertisement.model) != nil else { return }
         // The sender is reachable from here, unlike an address inside the
         // advertisement, which may belong to another interface of the receiver.
-        seen[ConsoleUDPSocket.text(of: sender)] = (
+        let address = ConsoleUDPSocket.text(of: sender)
+        // When the list is full, receivers already on it are still refreshed.
+        guard seen[address] != nil || seen.count < Self.maximumReceivers else { return }
+        seen[address] = (
             advertisement,
             ProcessInfo.processInfo.systemUptime
         )
@@ -102,8 +150,15 @@ public final class ShureDiscovery {
 /// addresses. Only models this library can read are reported.
 public final class ShureNetworkScanner {
     public struct Snapshot: Equatable {
+        public struct Found: Equatable {
+            public let address: String
+            /// Since the scan confirmed the receiver, so a result can expire.
+            public let secondsSinceFound: TimeInterval
+        }
+
         public let isScanning: Bool
-        public let addresses: [String]
+        /// In address order.
+        public let found: [Found]
     }
 
     private static let simultaneousProbes = 32
@@ -125,7 +180,8 @@ public final class ShureNetworkScanner {
     private let queue = DispatchQueue(label: "cz.splman.shurekit.scanner", qos: .utility)
     private var pending: ArraySlice<String> = []
     private var probes: [ObjectIdentifier: Probe] = [:]
-    private var found: Set<String> = []
+    /// System uptime at which each receiver answered.
+    private var found: [String: TimeInterval] = [:]
 
     public init() {}
 
@@ -136,10 +192,12 @@ public final class ShureNetworkScanner {
         }
     }
 
-    /// Starts a new scan unless one is running. Earlier results are kept.
+    /// Starts a new scan unless one is running. Its results replace earlier
+    /// ones, so a receiver that was switched off or moved does not stay found.
     public func start() {
         queue.async { [weak self] in
             guard let self, self.probes.isEmpty, self.pending.isEmpty else { return }
+            self.found = [:]
             var addresses: [String] = []
             for interface in ConsoleNetwork.ipv4Interfaces() {
                 addresses += Self.hostsToProbe(
@@ -162,15 +220,18 @@ public final class ShureNetworkScanner {
                 probe.connection.cancel()
             }
             probes = [:]
-            found = []
+            found = [:]
         }
     }
 
     public func snapshot() -> Snapshot {
         queue.sync {
-            Snapshot(
+            let now = ProcessInfo.processInfo.systemUptime
+            return Snapshot(
                 isScanning: !probes.isEmpty || !pending.isEmpty,
-                addresses: found.sorted { $0.compare($1, options: .numeric) == .orderedAscending }
+                found: found
+                    .map { Snapshot.Found(address: $0.key, secondsSinceFound: max(0, now - $0.value)) }
+                    .sorted { $0.address.compare($1.address, options: .numeric) == .orderedAscending }
             )
         }
     }
@@ -236,7 +297,7 @@ public final class ShureNetworkScanner {
             for message in probe.parser.consume(Array(data ?? Data())) {
                 if case .model(let name)? = ShureProtocol.deviceReport(from: message) {
                     if ShureReceiverModel(name: name) != nil {
-                        self.found.insert(probe.address)
+                        self.found[probe.address] = ProcessInfo.processInfo.systemUptime
                     }
                     self.finish(probe)
                     return
