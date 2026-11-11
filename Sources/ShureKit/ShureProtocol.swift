@@ -175,8 +175,11 @@ public enum ShureProtocol {
         let properties: [String]
         switch dialect {
         case .slxd: properties = ["CHAN_NAME", "TX_MODEL", "TX_BATT_BARS", "TX_BATT_MINS"]
-        // Slot 1 is the only transmitter slot of a channel.
-        case .slxdPlus: properties = ["CHAN_NAME", "LINK_TX_MODEL 1", "TX_BATT_BARS", "TX_BATT_MINS"]
+        // Slot 1 is the only transmitter slot of a channel. LINK_TX_MODEL is the
+        // documented property, but an SLXD4Q+ on firmware 1.4.4 rejects it and
+        // answers TX_MODEL, so both are asked; the rejected one is ignored.
+        case .slxdPlus:
+            properties = ["CHAN_NAME", "TX_MODEL", "LINK_TX_MODEL 1", "TX_BATT_BARS", "TX_BATT_MINS"]
         case .ulxd: properties = ["CHAN_NAME", "TX_TYPE", "BATT_BARS", "BATT_RUN_TIME"]
         }
         return properties.map { request("\(channel) \($0)") }
@@ -212,6 +215,16 @@ public enum ShureProtocol {
             case "AUDIO_LEVEL_RMS":
                 return .audioLevel(channel: channel, dBFS: scaled(value, valid: 0...120, offset: -120))
             case "RSSI":
+                // The command strings document one report per antenna, but an
+                // SLXD4Q+ on firmware 1.4.4 answers with one value and no antenna,
+                // as in its SAMPLE message: < REP x RSSI 017 >.
+                if tokens.count == 4 {
+                    return .rfLevel(
+                        channel: channel,
+                        antenna: 0,
+                        dBm: scaled(value, valid: 0...120, offset: -120)
+                    )
+                }
                 // The receivers have two antennas; anything else is not a reading.
                 guard tokens.count >= 5, let antenna = Int(value), (1...2).contains(antenna) else {
                     return nil

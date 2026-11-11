@@ -161,13 +161,18 @@ enum WirelessTests {
             ("< REP 3 RSSI 2 064 >", .rfLevel(channel: 3, antenna: 2, dBm: -56)),
             ("< REP 1 LINK_TX_MODEL 1 SLXD1+ >", .transmitter(channel: 1, model: "SLXD1+")),
             ("< REP 1 LINK_TX_MODEL 1 UNKNOWN >", .transmitter(channel: 1, model: nil)),
-            ("< REP 2 TX_BATT_MINS 00360 >", .batteryMinutes(channel: 2, minutes: 360))
+            ("< REP 2 TX_BATT_MINS 00360 >", .batteryMinutes(channel: 2, minutes: 360)),
+            // What an SLXD4Q+ on firmware 1.4.4 actually sends.
+            ("< REP 1 RSSI 017 >", .rfLevel(channel: 1, antenna: 0, dBm: -103)),
+            ("< REP 4 RSSI 083 >", .rfLevel(channel: 4, antenna: 0, dBm: -37)),
+            ("< REP 1 RSSI 121 >", .rfLevel(channel: 1, antenna: 0, dBm: nil)),
+            ("< REP 1 TX_MODEL UNKNOWN >", .transmitter(channel: 1, model: nil))
         ]
         for (text, expected) in plusCases where report(text, .slxdPlus) != expected {
             failures.append("SLX-D+ report was read incorrectly: \(text)")
         }
         // The receivers have antennas 1 and 2 only.
-        for text in ["< REP 1 RSSI 3 080 >", "< REP 1 RSSI 0 080 >"]
+        for text in ["< REP 1 RSSI 3 080 >", "< REP 1 RSSI 0 080 >", "< REP 1 RSSI >"]
         where report(text, .slxd) != nil || report(text, .slxdPlus) != nil {
             failures.append("SLX-D signal of an antenna that does not exist was accepted: \(text)")
         }
