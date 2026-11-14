@@ -118,6 +118,27 @@ enum TransferFunctionSmoothing: Int, CaseIterable, Codable, Identifiable {
     }
 }
 
+/// Impulse-response time window of the transfer-function magnitude.
+enum TransferFunctionWindowType: String, CaseIterable, Codable, Identifiable {
+    /// Classic frequency-dependent window anchored at the aligned IR peak.
+    case fixed
+    /// Frequency-dependent window that also follows the energy maximum of
+    /// each band, so late band energy (crossover, bass reflex, subwoofer
+    /// group delay) stays inside the window.
+    case tracking
+
+    static let `default`: TransferFunctionWindowType = .fixed
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .fixed: L10n.text("Pevné FDW")
+        case .tracking: L10n.text("Sledující maximum")
+        }
+    }
+}
+
 enum AnalysisDisplayMode: String, CaseIterable, Codable, Identifiable {
     case spectrogram
     case transferFunction
@@ -184,6 +205,7 @@ struct SpectrogramSettings: Codable, Equatable {
     var dynamicRangeDB = defaultDynamicRangeDB
     var transferFunctionRangeDB = defaultTransferFunctionRangeDB
     var transferFunctionSmoothing: TransferFunctionSmoothing = .default
+    var transferFunctionWindow: TransferFunctionWindowType = .default
     var referenceChannel: Int?
 
     private enum CodingKeys: String, CodingKey {
@@ -198,6 +220,7 @@ struct SpectrogramSettings: Codable, Equatable {
         case dynamicRangeDB
         case transferFunctionRangeDB
         case transferFunctionSmoothing
+        case transferFunctionWindow
         case isTransferFunctionEnabled
         case referenceChannel
     }
@@ -212,6 +235,7 @@ struct SpectrogramSettings: Codable, Equatable {
         dynamicRangeDB: Double = defaultDynamicRangeDB,
         transferFunctionRangeDB: Double = defaultTransferFunctionRangeDB,
         transferFunctionSmoothing: TransferFunctionSmoothing = .default,
+        transferFunctionWindow: TransferFunctionWindowType = .default,
         referenceChannel: Int? = nil
     ) {
         self.displayMode = displayMode
@@ -225,6 +249,7 @@ struct SpectrogramSettings: Codable, Equatable {
             transferFunctionRangeDB
         )
         self.transferFunctionSmoothing = transferFunctionSmoothing
+        self.transferFunctionWindow = transferFunctionWindow
         self.referenceChannel = referenceChannel
     }
 
@@ -285,6 +310,11 @@ struct SpectrogramSettings: Codable, Equatable {
             TransferFunctionSmoothing.self,
             forKey: .transferFunctionSmoothing
         )) ?? .default
+        // Likewise an unknown window type falls back to the default.
+        transferFunctionWindow = (try? container.decodeIfPresent(
+            TransferFunctionWindowType.self,
+            forKey: .transferFunctionWindow
+        )) ?? .default
         referenceChannel = try container.decodeIfPresent(Int.self, forKey: .referenceChannel)
     }
 
@@ -301,6 +331,7 @@ struct SpectrogramSettings: Codable, Equatable {
         try container.encode(dynamicRangeDB, forKey: .dynamicRangeDB)
         try container.encode(transferFunctionRangeDB, forKey: .transferFunctionRangeDB)
         try container.encode(transferFunctionSmoothing, forKey: .transferFunctionSmoothing)
+        try container.encode(transferFunctionWindow, forKey: .transferFunctionWindow)
         try container.encodeIfPresent(referenceChannel, forKey: .referenceChannel)
     }
 

@@ -205,6 +205,10 @@
 "Vyhlazení" = "Suavização";
 "1/%d oktávy" = "1/%d de oitava";
 "1 oktáva" = "1 oitava";
+"Časové okno" = "Janela temporal";
+"Pevné FDW" = "FDW fixa";
+"Sledující maximum" = "Rastreamento do máximo";
+"Sledující okno se v každém pásmu posouvá za energetickým maximem, takže zachová i zpožděnou energii výhybky, basreflexu nebo subwooferu." = "A janela acompanha o máximo de energia de cada banda e preserva assim a energia atrasada de crossover, bass reflex ou subwoofer.";
 "Meter bridge" = "Meter bridge";
 "Mixpult" = "Mesa de som";
 "Připojení mixpultu" = "Conexão da mesa";

@@ -205,6 +205,10 @@
 "Vyhlazení" = "Lissage";
 "1/%d oktávy" = "1/%d d’octave";
 "1 oktáva" = "1 octave";
+"Časové okno" = "Fenêtre temporelle";
+"Pevné FDW" = "FDW fixe";
+"Sledující maximum" = "Suivi du maximum";
+"Sledující okno se v každém pásmu posouvá za energetickým maximem, takže zachová i zpožděnou energii výhybky, basreflexu nebo subwooferu." = "La fenêtre suit le maximum d’énergie de chaque bande et conserve ainsi l’énergie retardée d’un filtre, d’un bass-reflex ou d’un caisson de basses.";
 "Meter bridge" = "Meter bridge";
 "Mixpult" = "Console de mixage";
 "Připojení mixpultu" = "Connexion de la console";

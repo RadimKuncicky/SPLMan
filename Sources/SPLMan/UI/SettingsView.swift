@@ -447,11 +447,27 @@ struct SettingsView: View {
                             .labelsHidden()
                             .fixedSize()
                         }
+
+                        settingRow(L10n.text("Časové okno")) {
+                            Picker(
+                                L10n.text("Časové okno"),
+                                selection: $model.settings.spectrogram.transferFunctionWindow
+                            ) {
+                                ForEach(TransferFunctionWindowType.allCases) { windowType in
+                                    Text(windowType.title).tag(windowType)
+                                }
+                            }
+                            .labelsHidden()
+                            .fixedSize()
+                        }
                     }
                 }
 
                 if model.settings.spectrogram.displayMode.showsTransferFunction {
                     caption(L10n.text("Křivka používá průběžné zarovnání impulsní odezvy a frekvenčně závislé časové okno."))
+                    if model.settings.spectrogram.transferFunctionWindow == .tracking {
+                        caption(L10n.text("Sledující okno se v každém pásmu posouvá za energetickým maximem, takže zachová i zpožděnou energii výhybky, basreflexu nebo subwooferu."))
+                    }
                 }
             }
 

@@ -205,6 +205,10 @@
 "Vyhlazení" = "Vyhlazení";
 "1/%d oktávy" = "1/%d oktávy";
 "1 oktáva" = "1 oktáva";
+"Časové okno" = "Časové okno";
+"Pevné FDW" = "Pevné FDW";
+"Sledující maximum" = "Sledující maximum";
+"Sledující okno se v každém pásmu posouvá za energetickým maximem, takže zachová i zpožděnou energii výhybky, basreflexu nebo subwooferu." = "Sledující okno se v každém pásmu posouvá za energetickým maximem, takže zachová i zpožděnou energii výhybky, basreflexu nebo subwooferu.";
 "Meter bridge" = "Meter bridge";
 "Mixpult" = "Mixpult";
 "Připojení mixpultu" = "Připojení mixpultu";

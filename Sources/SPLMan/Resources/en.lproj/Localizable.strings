@@ -205,6 +205,10 @@
 "Vyhlazení" = "Smoothing";
 "1/%d oktávy" = "1/%d octave";
 "1 oktáva" = "1 octave";
+"Časové okno" = "Time window";
+"Pevné FDW" = "Fixed FDW";
+"Sledující maximum" = "Peak tracking";
+"Sledující okno se v každém pásmu posouvá za energetickým maximem, takže zachová i zpožděnou energii výhybky, basreflexu nebo subwooferu." = "The tracking window follows the energy maximum in each band, so delayed energy from a crossover, bass reflex or subwoofer stays included.";
 "Meter bridge" = "Meter bridge";
 "Mixpult" = "Mixing console";
 "Připojení mixpultu" = "Console connection";

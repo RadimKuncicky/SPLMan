@@ -82,6 +82,35 @@ enum TransferFunctionDSP {
     private static let minimumDelayPeakMagnitude = 0.04
     private static let minimumNormalizedCorrelation = 0.05
 
+    // Tracking window ("FDW sledující maximum"). The per-band arrival time
+    // t*(f) is the maximum of the band envelope of the impulse response.
+    /// Bands per octave of the coarse grid on which t*(f) is estimated before
+    /// it is interpolated onto the analysis grid.
+    static let trackingBandsPerOctave = 12
+    /// The arrival search starts this long before the aligned IR peak.
+    static let trackingPreSearchDuration: TimeInterval = 0.001
+    /// The arrival search ends after this many periods of the band frequency,
+    /// so at high frequencies it cannot jump onto room reflections that the
+    /// short window is meant to exclude.
+    static let trackingSearchCycles = 3.0
+    /// Absolute upper limit of the arrival search (subwoofer and crossover
+    /// group delay, not room reflections).
+    static let maximumTrackedDelay: TimeInterval = 0.030
+    /// Coarse points in the median filter that rejects isolated outliers.
+    static let trackingMedianWidth = 5
+    /// Largest change of t*(f) between neighbouring coarse points, in periods
+    /// of the lower of the two frequencies.
+    static let trackingMaximumStepCycles = 1.0
+    /// Bands whose mean power is below this fraction of the strongest band
+    /// carry no usable energy (for example outside the reference band); their
+    /// t*(f) is interpolated from the usable neighbours instead.
+    static let trackingMinimumRelativeBandPower = 1e-6
+    /// Band-envelope samples per window length L and per search interval;
+    /// the finer of the two sets how far the envelope is decimated before
+    /// its maximum is searched.
+    private static let trackingEnvelopeSamplesPerWindow = 16.0
+    private static let trackingEnvelopeSamplesPerSearch = 8.0
+
     static func analysisFrameCount(sampleRate: Double) -> Int {
         guard sampleRate > 0 else { return SpectrogramAnalyzer.fftSize }
         let requiredDuration = max(
@@ -153,7 +182,8 @@ enum TransferFunctionDSP {
         frame: TransferSignalFrame,
         range: SpectrogramFrequencyRange,
         preferredDelaySamples: Double? = nil,
-        smoothing: TransferFunctionSmoothing = .default
+        smoothing: TransferFunctionSmoothing = .default,
+        windowType: TransferFunctionWindowType = .default
     ) -> TransferFunctionAnalysis {
         let count = frame.measurement.count
         guard count >= SpectrogramAnalyzer.fftSize,
@@ -351,17 +381,27 @@ enum TransferFunctionDSP {
 
         let frequencies = gridFrequencies(for: scale)
         let cycles = windowCycles(for: smoothing)
+        let trackedArrivals: [TimeInterval]? = windowType == .tracking
+            ? trackedArrivalTimes(
+                impulseResponse: transferReal,
+                frequencies: frequencies,
+                sampleRate: frame.sampleRate,
+                cycles: cycles,
+                validBins: validBins
+            )
+            : nil
         let binWidth = frame.sampleRate / Double(count)
         var points: [TransferFunctionPoint] = []
         points.reserveCapacity(frequencies.count)
-        for frequency in frequencies {
+        for (frequencyIndex, frequency) in frequencies.enumerated() {
             let nearestBin = min(count / 2, max(1, Int((frequency / binWidth).rounded())))
             guard validBins[nearestBin] else { continue }
             let magnitude = gatedMagnitude(
                 impulseResponse: transferReal,
                 frequency: frequency,
                 sampleRate: frame.sampleRate,
-                cycles: cycles
+                cycles: cycles,
+                trackedArrival: trackedArrivals?[frequencyIndex] ?? 0
             )
             guard magnitude.isFinite, magnitude > 1e-12 else { continue }
             let sums = bandSpectralSums(
@@ -554,11 +594,19 @@ enum TransferFunctionDSP {
         return abs(cross) / denominator
     }
 
+    /// Magnitude of the impulse response at `frequency` through the
+    /// frequency-dependent window: a rising half-Hann of length `pre` ending
+    /// at min(0, trackedArrival), weight 1 up to max(0, trackedArrival) and a
+    /// falling half-Hann of length L after it. Index 0 is t = 0; negative
+    /// times wrap at the end of the array. With `trackedArrival` = 0 this is
+    /// the classic fixed window. The window is not normalised, so a unit
+    /// impulse inside the flat part has magnitude 1.
     static func gatedMagnitude(
         impulseResponse: [Double],
         frequency: Double,
         sampleRate: Double,
-        cycles: Double = TransferFunctionDSP.cyclesInWindow
+        cycles: Double = TransferFunctionDSP.cyclesInWindow,
+        trackedArrival: TimeInterval = 0
     ) -> Double {
         let count = impulseResponse.count
         let effectiveWindowDuration = windowDuration(
@@ -575,20 +623,31 @@ enum TransferFunctionDSP {
             count / 2 - 1,
             max(1, Int((min(preWindowDuration, effectiveWindowDuration / 4) * sampleRate).rounded()))
         )
+        // The whole window must stay shorter than the circular IR.
+        let maximumPlateauSamples = max(0, count - 1 - preSamples - postSamples)
+        let requestedArrivalSamples = trackedArrival.isFinite
+            ? (trackedArrival * sampleRate).rounded()
+            : 0
+        let arrivalSamples = Int(max(
+            -Double(maximumPlateauSamples),
+            min(Double(maximumPlateauSamples), requestedArrivalSamples)
+        ))
+        let plateauStart = min(0, arrivalSamples)
+        let plateauEnd = max(0, arrivalSamples)
         var real = 0.0
         var imaginary = 0.0
         let signalStep = -2 * Double.pi * frequency / sampleRate
         let signalStepReal = cos(signalStep)
         let signalStepImaginary = sin(signalStep)
 
-        var signalReal = cos(signalStep * Double(-preSamples))
-        var signalImaginary = sin(signalStep * Double(-preSamples))
+        var signalReal = cos(signalStep * Double(plateauStart - preSamples))
+        var signalImaginary = sin(signalStep * Double(plateauStart - preSamples))
         let preWindowStep = Double.pi / Double(preSamples)
         let preWindowStepReal = cos(preWindowStep)
         let preWindowStepImaginary = sin(preWindowStep)
         var windowReal = 1.0
         var windowImaginary = 0.0
-        for offset in -preSamples..<0 {
+        for offset in (plateauStart - preSamples)..<plateauStart {
             let weight = 0.5 - 0.5 * windowReal
             let value = impulseResponse[count + offset] * weight
             real += value * signalReal
@@ -607,12 +666,24 @@ enum TransferFunctionDSP {
             )
         }
 
+        for offset in plateauStart..<plateauEnd {
+            let value = impulseResponse[offset < 0 ? count + offset : offset]
+            real += value * signalReal
+            imaginary += value * signalImaginary
+            advance(
+                real: &signalReal,
+                imaginary: &signalImaginary,
+                stepReal: signalStepReal,
+                stepImaginary: signalStepImaginary
+            )
+        }
+
         let postWindowStep = Double.pi / Double(postSamples)
         let postWindowStepReal = cos(postWindowStep)
         let postWindowStepImaginary = sin(postWindowStep)
         windowReal = 1
         windowImaginary = 0
-        for offset in 0...postSamples {
+        for offset in plateauEnd...(plateauEnd + postSamples) {
             let weight = 0.5 + 0.5 * windowReal
             let value = impulseResponse[offset] * weight
             real += value * signalReal
@@ -631,6 +702,255 @@ enum TransferFunctionDSP {
             )
         }
         return hypot(real, imaginary)
+    }
+
+    /// Per-band arrival time t*(f) for the tracking window, in seconds
+    /// relative to the aligned IR peak at index 0 (negative times wrap at the
+    /// end of the array), one value per entry of `frequencies`.
+    ///
+    /// On a coarse 1/`trackingBandsPerOctave`-octave grid spanning
+    /// `frequencies`, t*(f) is the maximum of the band envelope (Gaussian
+    /// band whose ±1σ spans 1/`cycles` octave) within
+    /// [-`trackingPreSearchDuration`, min(`maximumTrackedDelay`,
+    /// `trackingSearchCycles` / f)], refined by parabolic interpolation.
+    /// Bands below `trackingMinimumRelativeBandPower` of the strongest band,
+    /// or whose centre bin is not in `validBins`, are unusable: they are left
+    /// out of the median filter and filled by interpolation between the
+    /// nearest usable bands (held constant beyond the outermost one). The
+    /// curve is then step limited in both directions starting from the
+    /// strongest band and interpolated in log frequency. Every value is
+    /// clamped to its search interval. Returns all zeros when the input is
+    /// invalid or no band carries energy.
+    static func trackedArrivalTimes(
+        impulseResponse: [Double],
+        frequencies: [Double],
+        sampleRate: Double,
+        cycles: Double = TransferFunctionDSP.cyclesInWindow,
+        validBins: [Bool]? = nil
+    ) -> [TimeInterval] {
+        let count = impulseResponse.count
+        var arrivals = [TimeInterval](repeating: 0, count: frequencies.count)
+        let usableFrequencies = frequencies.filter { $0.isFinite && $0 > 0 }
+        guard count >= 16,
+              count.nonzeroBitCount == 1,
+              sampleRate.isFinite,
+              sampleRate > 0,
+              cycles.isFinite,
+              cycles > 0,
+              let lowest = usableFrequencies.min(),
+              let highest = usableFrequencies.max() else { return arrivals }
+
+        let octaveSpan = log2(highest / lowest)
+        let stepCount = max(1, Int(ceil(octaveSpan * Double(trackingBandsPerOctave))))
+        let coarseFrequencies = (0...stepCount).map { index in
+            lowest * pow(2, octaveSpan * Double(index) / Double(stepCount))
+        }
+
+        var spectrumReal = impulseResponse
+        var spectrumImaginary = [Double](repeating: 0, count: count)
+        fft(real: &spectrumReal, imaginary: &spectrumImaginary, inverse: false)
+
+        let bands = coarseFrequencies.map { frequency in
+            bandEnvelopeArrival(
+                spectrumReal: spectrumReal,
+                spectrumImaginary: spectrumImaginary,
+                frequency: frequency,
+                sampleRate: sampleRate,
+                cycles: cycles,
+                validBins: validBins
+            )
+        }
+        var maximumPower = 0.0
+        for band in bands where band.power.isFinite {
+            maximumPower = max(maximumPower, band.power)
+        }
+        guard maximumPower > 0 else { return arrivals }
+        let minimumPower = maximumPower * trackingMinimumRelativeBandPower
+        let validIndices = bands.indices.filter {
+            bands[$0].power.isFinite && bands[$0].power >= minimumPower
+        }
+        guard let anchor = validIndices.max(by: { bands[$0].power < bands[$1].power }) else {
+            return arrivals
+        }
+        var isValid = [Bool](repeating: false, count: bands.count)
+        for index in validIndices { isValid[index] = true }
+
+        // Median over the usable neighbours only.
+        let medianRadius = trackingMedianWidth / 2
+        var regularized = [TimeInterval](repeating: 0, count: bands.count)
+        for index in validIndices {
+            let neighbors = (max(0, index - medianRadius)...min(bands.count - 1, index + medianRadius))
+                .filter { isValid[$0] }
+                .map { bands[$0].arrival }
+                .sorted()
+            let middle = neighbors.count / 2
+            let median = neighbors.count % 2 == 1
+                ? neighbors[middle]
+                : (neighbors[middle - 1] + neighbors[middle]) / 2
+            regularized[index] = clampedArrival(median, frequency: coarseFrequencies[index])
+        }
+        // Unusable bands follow their usable neighbours.
+        for index in bands.indices where !isValid[index] {
+            let below = validIndices.last(where: { $0 < index })
+            let above = validIndices.first(where: { $0 > index })
+            let value: TimeInterval
+            if let below, let above {
+                let fraction = Double(index - below) / Double(above - below)
+                value = regularized[below] + fraction * (regularized[above] - regularized[below])
+            } else {
+                value = regularized[below ?? above ?? index]
+            }
+            regularized[index] = clampedArrival(value, frequency: coarseFrequencies[index])
+        }
+        // Step limit outwards from the strongest band.
+        for index in (anchor + 1)..<regularized.count {
+            let step = trackingMaximumStepCycles / coarseFrequencies[index - 1]
+            let previous = regularized[index - 1]
+            regularized[index] = clampedArrival(
+                min(previous + step, max(previous - step, regularized[index])),
+                frequency: coarseFrequencies[index]
+            )
+        }
+        for index in stride(from: anchor - 1, through: 0, by: -1) {
+            let step = trackingMaximumStepCycles / coarseFrequencies[index]
+            let next = regularized[index + 1]
+            regularized[index] = clampedArrival(
+                min(next + step, max(next - step, regularized[index])),
+                frequency: coarseFrequencies[index]
+            )
+        }
+
+        for (index, frequency) in frequencies.enumerated() {
+            guard frequency.isFinite, frequency > 0 else { continue }
+            let position = octaveSpan > 0
+                ? min(
+                    Double(stepCount),
+                    max(0, log2(frequency / lowest) / octaveSpan * Double(stepCount))
+                )
+                : 0
+            let lowerIndex = min(stepCount - 1, Int(position))
+            let fraction = position - Double(lowerIndex)
+            let value = regularized[lowerIndex]
+                + fraction * (regularized[lowerIndex + 1] - regularized[lowerIndex])
+            arrivals[index] = clampedArrival(value, frequency: frequency)
+        }
+        return arrivals
+    }
+
+    private static func trackingSearchEnd(for frequency: Double) -> TimeInterval {
+        min(maximumTrackedDelay, trackingSearchCycles / frequency)
+    }
+
+    private static func clampedArrival(
+        _ arrival: TimeInterval,
+        frequency: Double
+    ) -> TimeInterval {
+        min(trackingSearchEnd(for: frequency), max(-trackingPreSearchDuration, arrival))
+    }
+
+    /// Time of the band-envelope maximum around `frequency` within the
+    /// tracking search interval, and the band's weighted mean power per bin
+    /// (0 when its centre bin is not in `validBins`). The band is taken from
+    /// the one-sided IR spectrum, shifted to DC and inverse transformed with
+    /// a small FFT, which yields the decimated complex envelope directly.
+    private static func bandEnvelopeArrival(
+        spectrumReal: [Double],
+        spectrumImaginary: [Double],
+        frequency: Double,
+        sampleRate: Double,
+        cycles: Double,
+        validBins: [Bool]?
+    ) -> (arrival: TimeInterval, power: Double) {
+        let count = spectrumReal.count
+        let binWidth = sampleRate / Double(count)
+        let halfBandRatio = pow(2, 1 / (2 * cycles))
+        let sigma = max(binWidth, frequency * (halfBandRatio - 1 / halfBandRatio) / 2)
+        let centerBin = min(count / 2, max(1, Int((frequency / binWidth).rounded())))
+        let halfSpan = Int(ceil(4 * sigma / binWidth))
+        let lowerBin = max(1, centerBin - halfSpan)
+        let upperBin = min(count / 2, centerBin + halfSpan)
+        let window = windowDuration(
+            for: frequency,
+            sampleRate: sampleRate,
+            frameCount: count,
+            cycles: cycles
+        )
+        let searchEnd = trackingSearchEnd(for: frequency)
+        let maximumSpacing = max(
+            1,
+            Int(min(
+                window / trackingEnvelopeSamplesPerWindow,
+                (searchEnd + trackingPreSearchDuration) / trackingEnvelopeSamplesPerSearch
+            ) * sampleRate)
+        )
+        var size = 2
+        while size < count
+            && (size < upperBin - lowerBin + 1 || count / size > maximumSpacing) {
+            size <<= 1
+        }
+
+        var bandReal = [Double](repeating: 0, count: size)
+        var bandImaginary = [Double](repeating: 0, count: size)
+        var weightedPower = 0.0
+        var weightSum = 0.0
+        for bin in lowerBin...upperBin {
+            let offset = (Double(bin) * binWidth - frequency) / sigma
+            let weight = exp(-0.5 * offset * offset)
+            let index = ((bin - centerBin) % size + size) % size
+            bandReal[index] = weight * spectrumReal[bin]
+            bandImaginary[index] = weight * spectrumImaginary[bin]
+            weightedPower += weight * weight * (
+                spectrumReal[bin] * spectrumReal[bin]
+                    + spectrumImaginary[bin] * spectrumImaginary[bin]
+            )
+            weightSum += weight * weight
+        }
+        var bandPower = weightSum > 0 ? weightedPower / weightSum : 0
+        if let validBins, centerBin < validBins.count, !validBins[centerBin] {
+            bandPower = 0
+        }
+        fft(real: &bandReal, imaginary: &bandImaginary, inverse: true)
+
+        // Envelope sample m is IR sample m * count / size; negative lags wrap.
+        func envelopePower(_ lag: Int) -> Double {
+            let index = lag >= 0 ? lag : size + lag
+            return bandReal[index] * bandReal[index]
+                + bandImaginary[index] * bandImaginary[index]
+        }
+        let lagDuration = Double(count / size) / sampleRate
+        let maximumLag = size / 2 - 1
+        let lowerLag = -min(
+            maximumLag,
+            Int((trackingPreSearchDuration / lagDuration).rounded(.up))
+        )
+        let upperLag = min(maximumLag, Int((searchEnd / lagDuration).rounded(.up)))
+        // Ties and an empty band keep t* at the aligned IR peak.
+        var bestLag = 0
+        var bestPower = envelopePower(0)
+        for lag in lowerLag...upperLag where lag != 0 {
+            let power = envelopePower(lag)
+            if power > bestPower {
+                bestPower = power
+                bestLag = lag
+            }
+        }
+        // Parabolic interpolation of the log power (exact for a Gaussian
+        // envelope) refines the decimated maximum.
+        var position = Double(bestLag)
+        if bestLag > lowerLag, bestLag < upperLag {
+            let previousPower = envelopePower(bestLag - 1)
+            let nextPower = envelopePower(bestLag + 1)
+            if previousPower > 0, nextPower > 0, bestPower > 0 {
+                let previousLog = log(previousPower)
+                let bestLog = log(bestPower)
+                let nextLog = log(nextPower)
+                let curvature = previousLog - 2 * bestLog + nextLog
+                if curvature < 0 {
+                    position += max(-0.5, min(0.5, 0.5 * (previousLog - nextLog) / curvature))
+                }
+            }
+        }
+        return (position * lagDuration, bandPower)
     }
 
     private static func advance(
@@ -712,6 +1032,7 @@ final class TransferFunctionAnalyzer: @unchecked Sendable {
     private var pendingFrames: [TransferSignalFrame] = []
     private var pendingRange: SpectrogramFrequencyRange = .full
     private var pendingSmoothing: TransferFunctionSmoothing = .default
+    private var pendingWindowType: TransferFunctionWindowType = .default
     private var pendingCompletion: (@MainActor (TransferFunctionAnalysis) -> Void)?
     private var pendingReset = false
 
@@ -725,6 +1046,7 @@ final class TransferFunctionAnalyzer: @unchecked Sendable {
     private var previousDelaySamples: Double?
     private var previousCurve: TransferFunctionCurve?
     private var processedSmoothing: TransferFunctionSmoothing?
+    private var processedWindowType: TransferFunctionWindowType?
     private var curveAverager = TransferFunctionAverager()
 
     func invalidate() {
@@ -739,6 +1061,7 @@ final class TransferFunctionAnalyzer: @unchecked Sendable {
         _ frames: [TransferSignalFrame],
         range: SpectrogramFrequencyRange,
         smoothing: TransferFunctionSmoothing = .default,
+        windowType: TransferFunctionWindowType = .default,
         completion: @escaping @MainActor (TransferFunctionAnalysis) -> Void
     ) {
         guard !frames.isEmpty else { return }
@@ -764,6 +1087,7 @@ final class TransferFunctionAnalyzer: @unchecked Sendable {
         }
         pendingRange = range
         pendingSmoothing = smoothing
+        pendingWindowType = windowType
         pendingCompletion = completion
         let shouldStartWorker = !isWorkerRunning
         if shouldStartWorker { isWorkerRunning = true }
@@ -783,6 +1107,7 @@ final class TransferFunctionAnalyzer: @unchecked Sendable {
             pendingFrames.removeAll(keepingCapacity: true)
             let range = pendingRange
             let smoothing = pendingSmoothing
+            let windowType = pendingWindowType
             let completion = pendingCompletion
             let requestedGeneration = generation
             let shouldReset = pendingReset
@@ -797,11 +1122,13 @@ final class TransferFunctionAnalyzer: @unchecked Sendable {
                     preservingCurveHistory: true
                 )
             }
-            if processedSmoothing != smoothing {
-                // The smoothing sets the impulse-response window length, so
-                // blocks analysed with a different window must not be averaged
-                // into the new curve. Delay tracking and AutoGain are kept.
+            if processedSmoothing != smoothing || processedWindowType != windowType {
+                // The smoothing and the window type set the impulse-response
+                // window, so blocks analysed with a different window must not
+                // be averaged into the new curve. Delay tracking and AutoGain
+                // are kept.
                 processedSmoothing = smoothing
+                processedWindowType = windowType
                 curveAverager.reset()
             }
             for frame in frames {
@@ -809,6 +1136,7 @@ final class TransferFunctionAnalyzer: @unchecked Sendable {
                     frame,
                     range: range,
                     smoothing: smoothing,
+                    windowType: windowType,
                     generation: requestedGeneration,
                     completion: completion
                 )
@@ -820,6 +1148,7 @@ final class TransferFunctionAnalyzer: @unchecked Sendable {
         _ frame: TransferSignalFrame,
         range: SpectrogramFrequencyRange,
         smoothing: TransferFunctionSmoothing,
+        windowType: TransferFunctionWindowType,
         generation: UInt64,
         completion: (@MainActor (TransferFunctionAnalysis) -> Void)?
     ) {
@@ -867,7 +1196,8 @@ final class TransferFunctionAnalyzer: @unchecked Sendable {
                 ),
                 range: range,
                 preferredDelaySamples: previousDelaySamples,
-                smoothing: smoothing
+                smoothing: smoothing,
+                windowType: windowType
             )
             analysis = averaged(
                 analysis,

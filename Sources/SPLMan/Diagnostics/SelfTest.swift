@@ -28,6 +28,7 @@ enum SelfTest {
         testSpectrogramTimeline(&failures)
         testTransferFunctionAnalyzer(&failures)
         testTransferFunctionSmoothing(&failures)
+        testTransferFunctionTrackingWindow(&failures)
         testTransferFunctionDisplayState(&failures)
         testTransferFunctionTraceVector(&failures)
         testThresholds(&failures)
@@ -728,6 +729,11 @@ enum SelfTest {
             || TransferFunctionSmoothing.allCases.map(\.bandsPerOctave) != [48, 24, 12, 6, 3, 1] {
             failures.append("Transfer function smoothing defaults or options changed")
         }
+        if defaultSpectrogram.transferFunctionWindow != .fixed
+            || TransferFunctionWindowType.default != .fixed
+            || TransferFunctionWindowType.allCases != [.fixed, .tracking] {
+            failures.append("Transfer function window type defaults or options changed")
+        }
         if AnalysisDisplayMode.spectrogram.next != .transferFunction
             || AnalysisDisplayMode.transferFunction.next != .combined
             || AnalysisDisplayMode.combined.next != .meterBridge
@@ -779,12 +785,16 @@ enum SelfTest {
             dynamicRangeDB: 64,
             transferFunctionRangeDB: 24,
             transferFunctionSmoothing: .oneTwentyFourth,
+            transferFunctionWindow: .tracking,
             referenceChannel: 1
         )
         do {
             let encoded = try PropertyListEncoder().encode(settings)
             let decoded = try PropertyListDecoder().decode(PersistedSettings.self, from: encoded)
             if decoded != settings { failures.append("Settings persistence did not round-trip") }
+            if decoded.spectrogram.transferFunctionWindow != .tracking {
+                failures.append("Transfer function window type did not round-trip")
+            }
 
             guard var booleanLegacyObject = try PropertyListSerialization.propertyList(
                 from: encoded,
@@ -847,6 +857,7 @@ enum SelfTest {
             nestedSpectrogram.removeValue(forKey: "isTransferFunctionEnabled")
             nestedSpectrogram.removeValue(forKey: "referenceChannel")
             nestedSpectrogram.removeValue(forKey: "transferFunctionSmoothing")
+            nestedSpectrogram.removeValue(forKey: "transferFunctionWindow")
             nestedLegacyObject["spectrogram"] = nestedSpectrogram
             let nestedLegacyData = try PropertyListSerialization.data(
                 fromPropertyList: nestedLegacyObject,
@@ -863,6 +874,7 @@ enum SelfTest {
                 || nestedLegacyDecoded.spectrogram.palette != .current
                 || nestedLegacyDecoded.spectrogram.displayMode != .spectrogram
                 || nestedLegacyDecoded.spectrogram.transferFunctionSmoothing != .default
+                || nestedLegacyDecoded.spectrogram.transferFunctionWindow != .fixed
                 || nestedLegacyDecoded.spectrogram.referenceChannel != nil {
                 failures.append("Legacy analysis settings did not receive current level defaults")
             }
@@ -895,6 +907,31 @@ enum SelfTest {
             expectedUnknownSmoothing.transferFunctionSmoothing = .default
             if unknownSmoothingDecoded.spectrogram != expectedUnknownSmoothing {
                 failures.append("Unknown transfer function smoothing reset other analysis settings")
+            }
+
+            guard var unknownWindowObject = try PropertyListSerialization.propertyList(
+                from: encoded,
+                format: nil
+            ) as? [String: Any],
+            var unknownWindowSpectrogram = unknownWindowObject["spectrogram"]
+                as? [String: Any] else {
+                failures.append("Unknown window type fixture could not be created")
+                return
+            }
+            unknownWindowSpectrogram["transferFunctionWindow"] = "futureWindow"
+            unknownWindowObject["spectrogram"] = unknownWindowSpectrogram
+            let unknownWindowDecoded = try PropertyListDecoder().decode(
+                PersistedSettings.self,
+                from: PropertyListSerialization.data(
+                    fromPropertyList: unknownWindowObject,
+                    format: .binary,
+                    options: 0
+                )
+            )
+            var expectedUnknownWindow = settings.spectrogram
+            expectedUnknownWindow.transferFunctionWindow = .fixed
+            if unknownWindowDecoded.spectrogram != expectedUnknownWindow {
+                failures.append("Unknown transfer function window type reset other analysis settings")
             }
         } catch {
             failures.append("Settings persistence failed: \(error.localizedDescription)")
@@ -2295,6 +2332,268 @@ enum SelfTest {
                 ) - 0.048
             ) > 1e-12 {
             failures.append("Transfer function smoothing did not scale the IR window")
+        }
+    }
+
+    private static func testTransferFunctionTrackingWindow(_ failures: inout [String]) {
+        let sampleRate = 48_000.0
+        let count = TransferFunctionDSP.analysisFrameCount(sampleRate: sampleRate)
+        guard let scale = SpectrogramFrequencyScale(
+            sampleRate: sampleRate,
+            frameCount: count,
+            range: .focused
+        ) else {
+            failures.append("Transfer function tracking-window scale was invalid")
+            return
+        }
+        let frequencies = TransferFunctionDSP.gridFrequencies(for: scale)
+        let cycles = TransferFunctionDSP.windowCycles(for: .default)
+        func gatedDB(
+            _ impulseResponse: [Double],
+            _ frequency: Double,
+            arrival: TimeInterval
+        ) -> Double {
+            20 * log10(max(1e-20, TransferFunctionDSP.gatedMagnitude(
+                impulseResponse: impulseResponse,
+                frequency: frequency,
+                sampleRate: sampleRate,
+                cycles: cycles,
+                trackedArrival: arrival
+            )))
+        }
+        func fullLengthDB(_ impulseResponse: [Double], _ frequency: Double) -> Double {
+            var real = 0.0
+            var imaginary = 0.0
+            for (index, value) in impulseResponse.enumerated() where value != 0 {
+                let phase = -2 * Double.pi * frequency * Double(index) / sampleRate
+                real += value * cos(phase)
+                imaginary += value * sin(phase)
+            }
+            return 20 * log10(max(1e-20, hypot(real, imaginary)))
+        }
+        func arrivals(_ impulseResponse: [Double]) -> [TimeInterval] {
+            TransferFunctionDSP.trackedArrivalTimes(
+                impulseResponse: impulseResponse,
+                frequencies: frequencies,
+                sampleRate: sampleRate,
+                cycles: cycles
+            )
+        }
+
+        // Unit impulses inside the flat part keep the fixed window's gain.
+        let trackedDelaySamples = Int(0.005 * sampleRate)
+        var directImpulse = [Double](repeating: 0, count: count)
+        directImpulse[0] = 1
+        var delayedImpulse = [Double](repeating: 0, count: count)
+        delayedImpulse[trackedDelaySamples] = 1
+        var earlyImpulse = [Double](repeating: 0, count: count)
+        earlyImpulse[count - Int(0.0005 * sampleRate)] = 1
+        for frequency in [100.0, 1_000, 8_000] {
+            let directMagnitude = TransferFunctionDSP.gatedMagnitude(
+                impulseResponse: directImpulse,
+                frequency: frequency,
+                sampleRate: sampleRate,
+                trackedArrival: 0.005
+            )
+            let delayedMagnitude = TransferFunctionDSP.gatedMagnitude(
+                impulseResponse: delayedImpulse,
+                frequency: frequency,
+                sampleRate: sampleRate,
+                trackedArrival: 0.005
+            )
+            let earlyMagnitude = TransferFunctionDSP.gatedMagnitude(
+                impulseResponse: earlyImpulse,
+                frequency: frequency,
+                sampleRate: sampleRate,
+                trackedArrival: -0.0005
+            )
+            if abs(directMagnitude - 1) > 1e-9
+                || abs(delayedMagnitude - 1) > 1e-9
+                || abs(earlyMagnitude - 1) > 1e-9 {
+                failures.append(
+                    String(
+                        format: "Transfer function tracking window changed unit-impulse gain at %.0f Hz: %.6f/%.6f/%.6f",
+                        frequency,
+                        directMagnitude,
+                        delayedMagnitude,
+                        earlyMagnitude
+                    )
+                )
+            }
+        }
+
+        // a) A unit impulse at t = 0 is tracked at t = 0, so both windows agree.
+        let directArrivals = arrivals(directImpulse)
+        var directDeviation = 0.0
+        for (index, frequency) in frequencies.enumerated() where index < directArrivals.count {
+            directDeviation = max(
+                directDeviation,
+                abs(
+                    gatedDB(directImpulse, frequency, arrival: directArrivals[index])
+                        - gatedDB(directImpulse, frequency, arrival: 0)
+                )
+            )
+        }
+        if directArrivals.count != frequencies.count
+            || directArrivals.contains(where: { abs($0) > 1e-9 })
+            || directDeviation > 0.05 {
+            failures.append(
+                String(
+                    format: "Transfer function tracking window moved a direct impulse: %.3f dB, max t* %.6f s",
+                    directDeviation,
+                    directArrivals.map { abs($0) }.max() ?? .nan
+                )
+            )
+        }
+
+        // b) A band-limited pulse 5 ms late (energy around 300-600 Hz) is
+        // attenuated by the fixed window but kept by the tracking window.
+        let pulseDelay = 0.005
+        let pulseFrequency = 450.0
+        let pulseWidth = 0.001
+        let pulse = (0..<count).map { index -> Double in
+            let time = Double(index) / sampleRate - pulseDelay
+            let envelope = exp(-0.5 * (time / pulseWidth) * (time / pulseWidth))
+            return envelope * cos(2 * Double.pi * pulseFrequency * time)
+        }
+        let pulseArrivals = arrivals(pulse)
+        for target in [400.0, 450, 500] {
+            guard pulseArrivals.count == frequencies.count,
+                  let index = frequencies.indices.min(by: {
+                      abs(frequencies[$0] - target) < abs(frequencies[$1] - target)
+                  }) else {
+                failures.append("Transfer function tracking window returned no arrival times")
+                break
+            }
+            let frequency = frequencies[index]
+            let trueLevel = fullLengthDB(pulse, frequency)
+            let trackedLevel = gatedDB(pulse, frequency, arrival: pulseArrivals[index])
+            let fixedLevel = gatedDB(pulse, frequency, arrival: 0)
+            if abs(trackedLevel - trueLevel) > 1
+                || abs(pulseArrivals[index] - pulseDelay) > 0.001
+                || trueLevel - fixedLevel < 2 {
+                failures.append(
+                    String(
+                        format: "Transfer function tracking window at %.0f Hz: true %.2f, tracked %.2f, fixed %.2f dB, t* %.4f s",
+                        frequency,
+                        trueLevel,
+                        trackedLevel,
+                        fixedLevel,
+                        pulseArrivals[index]
+                    )
+                )
+            }
+        }
+
+        // c) A strong late reflection must not capture t* at high frequencies.
+        var reflected = [Double](repeating: 0, count: count)
+        reflected[0] = 1
+        reflected[Int(0.020 * sampleRate)] = 0.5
+        let reflectedArrivals = arrivals(reflected)
+        var reflectedDeviation = 0.0
+        var reflectedArrival = 0.0
+        for (index, frequency) in frequencies.enumerated()
+        where frequency >= 4_000 && index < reflectedArrivals.count {
+            reflectedArrival = max(reflectedArrival, abs(reflectedArrivals[index]))
+            reflectedDeviation = max(
+                reflectedDeviation,
+                abs(
+                    gatedDB(reflected, frequency, arrival: reflectedArrivals[index])
+                        - gatedDB(reflected, frequency, arrival: 0)
+                )
+            )
+        }
+        if reflectedArrivals.count != frequencies.count
+            || reflectedArrival > 0.000_1
+            || reflectedDeviation > 0.05 {
+            failures.append(
+                String(
+                    format: "Transfer function tracking window followed a reflection: t* %.5f s, %.3f dB",
+                    reflectedArrival,
+                    reflectedDeviation
+                )
+            )
+        }
+
+        // d) Above a band edge only a -140 dB noise floor remains. Those bands
+        // must not set t* from noise, neither there nor below the edge.
+        let edgeBins = Int(1_000 / (sampleRate / Double(count)))
+        var noiseState: UInt64 = 0x00C0_FFEE
+        let bandLimited = (0..<count).map { index -> Double in
+            // Brick-wall low pass of a unit impulse (Dirichlet kernel).
+            let lowPass = index == 0
+                ? Double(2 * edgeBins + 1) / Double(count)
+                : sin(Double.pi * Double(2 * edgeBins + 1) * Double(index) / Double(count))
+                    / (Double(count) * sin(Double.pi * Double(index) / Double(count)))
+            guard index > 0 else { return lowPass }
+            noiseState = noiseState &* 6_364_136_223_846_793_005 &+ 1
+            return lowPass
+                + 1e-7 * Double(Int64(bitPattern: noiseState)) / Double(Int64.max)
+        }
+        for smoothing in [TransferFunctionSmoothing.default, .oneFortyEighth] {
+            let bandLimitedArrivals = TransferFunctionDSP.trackedArrivalTimes(
+                impulseResponse: bandLimited,
+                frequencies: frequencies,
+                sampleRate: sampleRate,
+                cycles: TransferFunctionDSP.windowCycles(for: smoothing)
+            )
+            var insideArrival = 0.0
+            var outsideArrival = 0.0
+            for (index, frequency) in frequencies.enumerated()
+            where index < bandLimitedArrivals.count {
+                if frequency <= 700 {
+                    insideArrival = max(insideArrival, abs(bandLimitedArrivals[index]))
+                } else if frequency >= 2_000 {
+                    outsideArrival = max(outsideArrival, abs(bandLimitedArrivals[index]))
+                }
+            }
+            if bandLimitedArrivals.count != frequencies.count
+                || insideArrival > 0.000_05
+                || outsideArrival > 0.000_05 {
+                failures.append(
+                    String(
+                        format: "Transfer function tracking window followed noise outside the band (1/%d): t* %.5f/%.5f s",
+                        smoothing.bandsPerOctave,
+                        insideArrival,
+                        outsideArrival
+                    )
+                )
+            }
+        }
+
+        // End to end: a delayed broadband measurement stays valid and keeps its gain.
+        let delay = 480
+        let gain = 0.5
+        var state: UInt64 = 0x0BAD_F00D
+        var reference = [Float](repeating: 0, count: count)
+        for index in reference.indices {
+            state = state &* 6_364_136_223_846_793_005 &+ 1
+            reference[index] = Float(0.2 * Double(Int64(bitPattern: state)) / Double(Int64.max))
+        }
+        var measurement = [Float](repeating: 0, count: count)
+        for index in delay..<count {
+            measurement[index] = Float(gain) * reference[index - delay]
+        }
+        let trackingAnalysis = TransferFunctionDSP.analyze(
+            frame: TransferSignalFrame(
+                measurement: measurement,
+                reference: reference,
+                sampleRate: sampleRate,
+                capturedAtUptime: 1
+            ),
+            range: .focused,
+            windowType: .tracking
+        )
+        let trackingLevels = (trackingAnalysis.curve?.points ?? [])
+            .filter { $0.frequency >= 200 && $0.frequency <= 5_000 }
+            .map(\.magnitudeDB)
+            .sorted()
+        let trackingMedian = trackingLevels.isEmpty
+            ? .infinity
+            : trackingLevels[trackingLevels.count / 2]
+        if trackingAnalysis.validity != .valid
+            || abs(trackingMedian - 20 * log10(gain)) > 1.0 {
+            failures.append("Transfer function tracking window did not recover a known broadband gain")
         }
     }
 

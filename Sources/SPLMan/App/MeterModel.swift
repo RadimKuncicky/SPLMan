@@ -614,17 +614,20 @@ final class MeterModel: ObservableObject {
                 )
             }
             let smoothing = settings.spectrogram.transferFunctionSmoothing
+            let windowType = settings.spectrogram.transferFunctionWindow
             transferFunctionAnalyzer.analyze(
                 transferFrames,
                 range: frequencyRange,
-                smoothing: smoothing
+                smoothing: smoothing,
+                windowType: windowType
             ) { [weak self] analysis in
                 guard let self,
                       self.isRunning,
                       self.settings.spectrogram.displayMode.showsTransferFunction,
                       self.activeReferenceChannel != nil,
                       self.settings.spectrogram.frequencyRange == frequencyRange,
-                      self.settings.spectrogram.transferFunctionSmoothing == smoothing
+                      self.settings.spectrogram.transferFunctionSmoothing == smoothing,
+                      self.settings.spectrogram.transferFunctionWindow == windowType
                 else { return }
                 self.transferFunctionAnalysis = self.transferFunctionDisplayState.update(
                     with: analysis,

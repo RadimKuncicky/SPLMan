@@ -205,6 +205,10 @@
 "Vyhlazení" = "Wygładzanie";
 "1/%d oktávy" = "1/%d oktawy";
 "1 oktáva" = "1 oktawa";
+"Časové okno" = "Okno czasowe";
+"Pevné FDW" = "Stałe FDW";
+"Sledující maximum" = "Śledzenie maksimum";
+"Sledující okno se v každém pásmu posouvá za energetickým maximem, takže zachová i zpožděnou energii výhybky, basreflexu nebo subwooferu." = "Okno śledzące podąża w każdym paśmie za maksimum energii, dzięki czemu obejmuje też opóźnioną energię zwrotnicy, bass-refleksu lub subwoofera.";
 "Meter bridge" = "Meter bridge";
 "Mixpult" = "Konsoleta";
 "Připojení mixpultu" = "Połączenie z konsoletą";

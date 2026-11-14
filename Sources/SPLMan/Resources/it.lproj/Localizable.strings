@@ -205,6 +205,10 @@
 "Vyhlazení" = "Smussamento";
 "1/%d oktávy" = "1/%d di ottava";
 "1 oktáva" = "1 ottava";
+"Časové okno" = "Finestra temporale";
+"Pevné FDW" = "FDW fissa";
+"Sledující maximum" = "Inseguimento del massimo";
+"Sledující okno se v každém pásmu posouvá za energetickým maximem, takže zachová i zpožděnou energii výhybky, basreflexu nebo subwooferu." = "La finestra segue il massimo di energia di ogni banda e conserva così l’energia ritardata di crossover, bass reflex o subwoofer.";
 "Meter bridge" = "Meter bridge";
 "Mixpult" = "Mixer";
 "Připojení mixpultu" = "Connessione del mixer";
